@@ -1,0 +1,2 @@
+time=2025-10-31T21:19:12.216+01:00 level=INFO msg="Logging to both stdout and file" exampleKey=exampleValue
+time=2025-10-31T21:19:12.216+01:00 level=DEBUG msg="Debug message"
