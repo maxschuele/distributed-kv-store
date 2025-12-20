@@ -1,0 +1,5 @@
+- Jede Gruppe sind replications
+- In dem Hashring sind dann jede gruppe einzeln gespeichert
+
+
+- Wenn Gruppe anfrage kriegt, dann überprüft er hash und falls nicht passt dann gibt er es weiter an den nächsten der das macht
