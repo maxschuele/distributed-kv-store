@@ -21,10 +21,12 @@ Each node runs both in separate goroutines.
 package discovery
 
 import (
+	"distributed-kv/cluster"
 	"fmt"
 	"log"
 	"net"
 	"syscall"
+	"time"
 )
 
 const (
@@ -71,7 +73,7 @@ func Broadcast(ip string, port int, announcement string) error {
 }
 
 // Listen listens for incoming broadcast announcements
-func Listen(listenPort int) error {
+func Listen(listenPort int, view *GroupView, selfNodeID string) error {
 	// Resolve the listen address
 	addr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("0.0.0.0:%d", listenPort))
 	if err != nil {
@@ -85,18 +87,46 @@ func Listen(listenPort int) error {
 	}
 	defer conn.Close()
 
-	log.Printf("Listening for broadcasts on port %d\n", listenPort)
+	log.Printf("[Discovery] Listening for broadcasts on port %d\n", listenPort)
 
 	// Receive announcements in a loop
 	buf := make([]byte, MaxDatagramSize)
 	for {
 		n, remoteAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("Error reading UDP: %v\n", err)
+			log.Printf("[Discovery] Error reading UDP: %v\n", err)
 			continue
 		}
 
 		announcement := string(buf[:n])
-		log.Printf("Received announcement from %s: %s\n", remoteAddr.IP.String(), announcement)
+		//log.Printf("Received announcement from %s: %s\n", remoteAddr.IP.String(), announcement)
+
+		if node, err := DecodeAnnounce(announcement); err == nil {
+			// Ignore our own announcements
+			if node.NodeID == selfNodeID {
+				continue
+			}
+
+			// Update GroupView with this node
+			view.AddOrUpdateNode(node)
+			log.Printf("[Discovery] Received announcement from %s at %s\n", node.NodeID, remoteAddr.IP.String())
+		} else {
+			log.Printf("[Discovery] Failed to decode message from %s: %v\n", remoteAddr.IP.String(), err)
+		}
+	}
+}
+
+// BroadcastHeartbeats periodically broadcasts node announcements (acts as heartbeat)
+func BroadcastHeartbeats(nodeInfo cluster.NodeInfo, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		msg := EncodeAnnounce(nodeInfo)
+		if err := Broadcast(BroadcastIP, BroadcastPort, msg); err != nil {
+			log.Printf("[Discovery] Failed to broadcast announcement: %v\n", err)
+		} else {
+			log.Printf("[Discovery] Broadcasted announcement\n")
+		}
 	}
 }

@@ -14,7 +14,20 @@ const (
 	MsgAnnounce        = "ANNOUNCE"
 	MsgDiscoverRequest = "DISCOVER_REQUEST"
 	MsgDiscoverResp    = "DISCOVER_RESPONSE"
+	MsgHeartbeat       = "HEARTBEAT"
 )
+
+func EncodeHeartbeat(nodeID string) string {
+	return fmt.Sprintf("%s|%s", MsgHeartbeat, nodeID)
+}
+
+func DecodeHeartbeat(msg string) (string, error) {
+	parts := strings.Split(msg, "|")
+	if len(parts) < 2 || parts[0] != MsgHeartbeat {
+		return "", fmt.Errorf("invalid heartbeat message")
+	}
+	return parts[1], nil
+}
 
 func EncodeAnnounce(node cluster.NodeInfo) string {
 	return fmt.Sprintf("%s|%s|%s|%d|%d|%t",
