@@ -30,10 +30,10 @@ import (
 )
 
 const (
-	BroadcastIP   = "192.168.178.255"
-	BroadcastPort = 5972
-	ListenPort    = 5972
-	// MaxDatagramSize  = 8192
+	BroadcastIP     = "192.168.178.255"
+	BroadcastPort   = 5972
+	ListenPort      = 5972
+	MaxDatagramSize = 8192
 )
 
 // Broadcast sends an announcement message to the broadcast address
