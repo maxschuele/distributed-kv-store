@@ -1,12 +1,13 @@
 package discovery
 
 import (
-	"distributed-kv/cluster"
 	"fmt"
 	"net"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/maxschuele/distkv/cluster"
 )
 
 // TestDiscoveryBroadcastAndListen tests that a broadcasting node is discovered by listening nodes

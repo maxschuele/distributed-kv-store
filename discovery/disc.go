@@ -21,12 +21,13 @@ Each node runs both in separate goroutines.
 package discovery
 
 import (
-	"distributed-kv/cluster"
 	"fmt"
 	"log"
 	"net"
 	"syscall"
 	"time"
+
+	"github.com/maxschuele/distkv/cluster"
 )
 
 const (

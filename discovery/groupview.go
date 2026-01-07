@@ -1,10 +1,11 @@
 package discovery
 
 import (
-	"distributed-kv/cluster"
 	"log"
 	"sync"
 	"time"
+
+	"github.com/maxschuele/distkv/cluster"
 )
 
 // GroupView maintains knowledge of all discovered nodes in the group

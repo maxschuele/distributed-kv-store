@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"distributed-kv/cluster"
+	"github.com/maxschuele/distkv/cluster"
 )
 
 // Simple string-based wire format
