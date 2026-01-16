@@ -1,8 +1,6 @@
 package discovery
 
 import (
-	"fmt"
-	"net"
 	"sync"
 	"testing"
 	"time"
@@ -44,25 +42,16 @@ func TestDiscoveryBroadcastAndListen(t *testing.T) {
 
 	// Start listening goroutines for both listeners
 	var wg sync.WaitGroup
-	done1 := make(chan struct{})
-	done2 := make(chan struct{})
 
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		// Listen with a cancellation mechanism
-		go func() {
-			<-done1
-		}()
-		ListenWithTimeout(ListenPort, view1, listener1Node.NodeID, 5*time.Second)
+		Listen(ListenPort, view1, listener1Node.NodeID)
 	}()
 
 	go func() {
 		defer wg.Done()
-		go func() {
-			<-done2
-		}()
-		ListenWithTimeout(ListenPort, view2, listener2Node.NodeID, 5*time.Second)
+		Listen(ListenPort, view2, listener2Node.NodeID)
 	}()
 
 	// Give listeners time to start
@@ -77,10 +66,6 @@ func TestDiscoveryBroadcastAndListen(t *testing.T) {
 
 	// Wait a bit for messages to be received
 	time.Sleep(1 * time.Second)
-
-	// Signal listeners to stop
-	close(done1)
-	close(done2)
 
 	// Check that both listeners discovered the broadcaster
 	nodes1 := view1.GetNodes()
@@ -117,6 +102,9 @@ func TestDiscoveryBroadcastAndListen(t *testing.T) {
 			t.Errorf("Listener 2 did not discover broadcaster node")
 		}
 	}
+
+	// Note: The listeners will continue running after the test completes
+	// This is expected behavior - they would be terminated when the application exits
 }
 
 // TestGroupViewAddNode tests adding a node to GroupView
@@ -360,41 +348,4 @@ func (gv *GroupView) getNodeRecord(nodeID string) *NodeRecord {
 	gv.mu.RLock()
 	defer gv.mu.RUnlock()
 	return gv.nodes[nodeID]
-}
-
-// ListenWithTimeout is a helper function that runs Listen with a timeout
-func ListenWithTimeout(listenPort int, view *GroupView, selfNodeID string, timeout time.Duration) {
-	done := make(chan struct{})
-	go func() {
-		time.Sleep(timeout)
-		close(done)
-	}()
-
-	addr, _ := net.ResolveUDPAddr("udp4", fmt.Sprintf("0.0.0.0:%d", listenPort))
-	conn, _ := net.ListenUDP("udp4", addr)
-	defer conn.Close()
-
-	// Set read deadline
-	conn.SetReadDeadline(time.Now().Add(timeout))
-
-	buf := make([]byte, MaxDatagramSize)
-	for {
-		select {
-		case <-done:
-			return
-		default:
-			n, _, err := conn.ReadFromUDP(buf)
-			if err != nil {
-				return
-			}
-
-			announcement := string(buf[:n])
-			if node, err := DecodeAnnounce(announcement); err == nil {
-				if node.NodeID == selfNodeID {
-					continue
-				}
-				view.AddOrUpdateNode(node)
-			}
-		}
-	}
 }

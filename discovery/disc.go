@@ -1,31 +1,14 @@
-/*
-Plan:
-New Nodes only knowledge on startup is broadcast address.
-Node sends broadcast announce including its ID and address.
-
-Existing members are in listening loop.
-Recieve announce, add to membership list if new.
-Respond with own unicast announce to new node.
-
-New node collects responses, builds membership list.
-
-(Should leader take care of membership? Or all nodes maintain full list?)
-Inidividual membership management requires additional logic to maintain consistency. (Heartbeats?)
-
-To build:
-Broadcast sender function
-Broadcast listener function
-Each node runs both in separate goroutines.
-*/
-
 package discovery
 
 import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/maxschuele/distkv/cluster"
 )
@@ -76,32 +59,52 @@ func Broadcast(ip string, port int, announcement string) error {
 
 // Listen listens for incoming broadcast announcements
 func Listen(listenPort int, view *GroupView, selfNodeID string) error {
-	// Resolve the listen address
-	addr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("0.0.0.0:%d", listenPort))
+	// Create a socket with SO_REUSEADDR and SO_REUSEPORT set before binding
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
 	if err != nil {
-		return fmt.Errorf("failed to resolve listen address: %w", err)
+		return fmt.Errorf("failed to create socket: %w", err)
+	}
+	defer unix.Close(fd)
+
+	// Enable SO_REUSEADDR and SO_REUSEPORT
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+		return fmt.Errorf("failed to set SO_REUSEADDR: %w", err)
 	}
 
-	// Create a UDP connection for listening
-	conn, err := net.ListenUDP("udp4", addr)
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+		return fmt.Errorf("failed to set SO_REUSEPORT: %w", err)
+	}
+
+	// Bind to the address
+	addr := unix.SockaddrInet4{Port: listenPort}
+	if err := unix.Bind(fd, &addr); err != nil {
+		return fmt.Errorf("failed to bind socket: %w", err)
+	}
+
+	// Convert to net.UDPConn
+	file := os.NewFile(uintptr(fd), "")
+	defer file.Close()
+
+	conn, err := net.FilePacketConn(file)
 	if err != nil {
-		return fmt.Errorf("failed to listen on UDP: %w", err)
+		return fmt.Errorf("failed to create connection from file: %w", err)
 	}
 	defer conn.Close()
+
+	udpConn := conn.(*net.UDPConn)
 
 	log.Printf("[Discovery] Listening for broadcasts on port %d\n", listenPort)
 
 	// Receive announcements in a loop
 	buf := make([]byte, MaxDatagramSize)
 	for {
-		n, remoteAddr, err := conn.ReadFromUDP(buf)
+		n, remoteAddr, err := udpConn.ReadFromUDP(buf)
 		if err != nil {
 			log.Printf("[Discovery] Error reading UDP: %v\n", err)
 			continue
 		}
 
 		announcement := string(buf[:n])
-		//log.Printf("Received announcement from %s: %s\n", remoteAddr.IP.String(), announcement)
 
 		if node, err := DecodeAnnounce(announcement); err == nil {
 			// Ignore our own announcements
