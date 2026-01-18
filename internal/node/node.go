@@ -85,10 +85,9 @@ func (n *Node) handleGroupMessage(conn net.Conn) {
 		// TODO
 		break
 	case *WriteRequestMessage:
-		fmt.Println("received group write message")
+		fmt.Println("received group write key message")
 		k := string(m.Key)
 		v := string(m.Value)
-		// Directly write to store to avoid infinite recursion
 		n.rw.Lock()
 		n.store[k] = v
 		n.rw.Unlock()
@@ -97,7 +96,19 @@ func (n *Node) handleGroupMessage(conn net.Conn) {
 			fmt.Println("sending key to members")
 			n.writeNotifyMembers(k, v)
 		}
+	case *DeleteRequestMessage:
+		fmt.Println("received group delete key message")
+		k := string(m.Key)
+		n.rw.Lock()
+		delete(n.store, k)
+		n.rw.Unlock()
+
+		if n.isLeader {
+			fmt.Println("sending key delete to members")
+			n.deleteNotifyMembers(k)
+		}
 	}
+
 }
 
 func (n *Node) handleGetKey(w *httpserver.ResponseWriter, r *httpserver.Request) {
@@ -130,7 +141,15 @@ func (n *Node) handlePutKey(w *httpserver.ResponseWriter, r *httpserver.Request)
 	}
 
 	value := r.Body
-	n.putKey(key, value)
+
+	if n.isLeader {
+		n.rw.Lock()
+		defer n.rw.Unlock()
+		n.store[key] = value
+		n.writeNotifyMembers(key, value)
+	} else {
+		n.writeNotifyLeader(key, value)
+	}
 
 	w.Status(200, "OK")
 	w.Write([]byte("OK"))
@@ -154,27 +173,15 @@ func (n *Node) handleDeleteKey(w *httpserver.ResponseWriter, r *httpserver.Reque
 		return
 	}
 
-	delete(n.store, key)
+	if n.isLeader {
+		delete(n.store, key)
+		n.deleteNotifyMembers(key)
+	} else {
+		n.deleteNotifyLeader(key)
+	}
 
 	w.Status(200, "OK")
 	w.Write([]byte("OK"))
-}
-
-func (n *Node) putKey(key string, value string) {
-	if n.isLeader {
-		n.rw.Lock()
-		defer n.rw.Unlock()
-		n.store[key] = value
-		n.writeNotifyMembers(key, value)
-	} else {
-		n.writeNotifyLeader(key, value)
-	}
-}
-
-func (n *Node) deleteKey(key string) {
-	n.rw.Lock()
-	defer n.rw.Unlock()
-	delete(n.store, key)
 }
 
 func (n *Node) writeNotifyLeader(key string, value string) error {
@@ -182,19 +189,7 @@ func (n *Node) writeNotifyLeader(key string, value string) error {
 		Key:   []byte(key),
 		Value: []byte(value),
 	}
-	bytes := w.Marshal()
-
-	conn, err := net.Dial("tcp", n.leaderAddr)
-	if err != nil {
-		fmt.Println("conn to leader failed")
-	}
-
-	// TODO: set a timeout, handle partial write
-	_, err = conn.Write(bytes)
-	if err != nil {
-		fmt.Println("write to leader failed")
-	}
-
+	n.notifyPeer(n.leaderAddr, w.Marshal())
 	return nil
 }
 
@@ -203,20 +198,45 @@ func (n *Node) writeNotifyMembers(key string, value string) {
 		Key:   []byte(key),
 		Value: []byte(value),
 	}
-	bytes := w.Marshal()
+	n.notifyMembers(w.Marshal())
+}
 
+func (n *Node) deleteNotifyLeader(key string) error {
+	d := DeleteRequestMessage{
+		Key: []byte(key),
+	}
+	return n.notifyPeer(n.leaderAddr, d.Marshal())
+}
+
+func (n *Node) deleteNotifyMembers(key string) error {
+	d := DeleteRequestMessage{
+		Key: []byte(key),
+	}
+	n.notifyMembers(d.Marshal())
+	return nil
+}
+
+func (n *Node) notifyPeer(addr string, data []byte) error {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		fmt.Println("conn to peer failed")
+		return err
+	}
+	defer conn.Close()
+
+	// TODO: set a timeout, handle partial write
+	_, err = conn.Write(data)
+	if err != nil {
+		fmt.Println("write to peer failed")
+		return err
+	}
+	return nil
+}
+
+func (n *Node) notifyMembers(data []byte) {
 	for addr := range n.group {
-		conn, err := net.Dial("tcp", addr)
-		if err != nil {
-			// TODO
-			fmt.Println("conn to member failed")
-		}
-
-		// TODO: set a timeout, handle partial write
-		_, err = conn.Write(bytes)
-		if err != nil {
-			// TODO
-			fmt.Println("write to member failed")
+		if err := n.notifyPeer(addr, data); err != nil {
+			// TODO: handle error appropriately
 		}
 	}
 }

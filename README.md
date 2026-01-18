@@ -1,7 +1,7 @@
 ```
 go run ./cmd/node -http :8080 -group :8081 -leader -members ":8083,:8085"
-go run ./cmd/node -http :8082 -group :8083 -members ":8081,:8085" -leader-addr :8081
-go run ./cmd/node -http :8084 -group :8085 -members ":8081,:8083" -leader-addr :8081
+go run ./cmd/node -http :8082 -group :8083 -members ":8085" -leader-addr :8081
+go run ./cmd/node -http :8084 -group :8085 -members ":8083" -leader-addr :8081
 ```
 
 ```sh
