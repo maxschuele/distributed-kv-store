@@ -13,7 +13,7 @@ func TestDiscoveryBroadcastAndListen(t *testing.T) {
 	// Create a broadcasting node
 	broadcasterNode := cluster.NodeInfo{
 		NodeID:   "broadcaster-node",
-		Host:     "127.0.0.1",
+		IP:       "127.0.0.1",
 		Port:     9001,
 		GroupID:  1,
 		IsLeader: true,
@@ -22,7 +22,7 @@ func TestDiscoveryBroadcastAndListen(t *testing.T) {
 	// Create listener nodes with their GroupViews
 	listener1Node := cluster.NodeInfo{
 		NodeID:   "listener-node-1",
-		Host:     "127.0.0.1",
+		IP:       "127.0.0.1",
 		Port:     9002,
 		GroupID:  1,
 		IsLeader: false,
@@ -30,11 +30,18 @@ func TestDiscoveryBroadcastAndListen(t *testing.T) {
 
 	listener2Node := cluster.NodeInfo{
 		NodeID:   "listener-node-2",
-		Host:     "127.0.0.1",
+		IP:       "127.0.0.1",
 		Port:     9003,
 		GroupID:  1,
 		IsLeader: false,
 	}
+
+	//
+	viewBroadcaster := NewGroupView()
+
+	go func() {
+		Listen(ListenPort, viewBroadcaster, broadcasterNode.NodeID)
+	}()
 
 	// Create GroupViews for each listener
 	view1 := NewGroupView()
@@ -103,8 +110,11 @@ func TestDiscoveryBroadcastAndListen(t *testing.T) {
 		}
 	}
 
-	// Note: The listeners will continue running after the test completes
-	// This is expected behavior - they would be terminated when the application exits
+	go BroadcastHeartbeats(listener1Node, 1*time.Second)
+	go BroadcastHeartbeats(listener2Node, 1*time.Second)
+	time.Sleep(10 * time.Second)
+	// look at broadcaster view if he gets group view only from heartbeats
+	t.Log("Broadcaster internal nodes: ", viewBroadcaster.GetNodes())
 }
 
 // TestGroupViewAddNode tests adding a node to GroupView
@@ -113,7 +123,7 @@ func TestGroupViewAddNode(t *testing.T) {
 
 	node := cluster.NodeInfo{
 		NodeID:   "test-node-1",
-		Host:     "127.0.0.1",
+		IP:       "127.0.0.1",
 		Port:     5000,
 		GroupID:  1,
 		IsLeader: false,
@@ -143,7 +153,7 @@ func TestGroupViewUpdateNode(t *testing.T) {
 
 	node1 := cluster.NodeInfo{
 		NodeID:   "test-node-1",
-		Host:     "127.0.0.1",
+		IP:       "127.0.0.1",
 		Port:     5000,
 		GroupID:  1,
 		IsLeader: false,
@@ -187,7 +197,7 @@ func TestGroupViewRemoveStaleNodes(t *testing.T) {
 
 	node1 := cluster.NodeInfo{
 		NodeID:   "test-node-1",
-		Host:     "127.0.0.1",
+		IP:       "127.0.0.1",
 		Port:     5000,
 		GroupID:  1,
 		IsLeader: false,
@@ -195,7 +205,7 @@ func TestGroupViewRemoveStaleNodes(t *testing.T) {
 
 	node2 := cluster.NodeInfo{
 		NodeID:   "test-node-2",
-		Host:     "127.0.0.1",
+		IP:       "127.0.0.1",
 		Port:     5001,
 		GroupID:  1,
 		IsLeader: false,
@@ -234,9 +244,9 @@ func TestGroupViewGetAllNodes(t *testing.T) {
 	gv := NewGroupView()
 
 	nodes := []cluster.NodeInfo{
-		{NodeID: "node-1", Host: "127.0.0.1", Port: 5000, GroupID: 1, IsLeader: false},
-		{NodeID: "node-2", Host: "127.0.0.1", Port: 5001, GroupID: 1, IsLeader: false},
-		{NodeID: "node-3", Host: "127.0.0.1", Port: 5002, GroupID: 1, IsLeader: true},
+		{NodeID: "node-1", IP: "127.0.0.1", Port: 5000, GroupID: 1, IsLeader: false},
+		{NodeID: "node-2", IP: "127.0.0.1", Port: 5001, GroupID: 1, IsLeader: false},
+		{NodeID: "node-3", IP: "127.0.0.1", Port: 5002, GroupID: 1, IsLeader: true},
 	}
 
 	for _, node := range nodes {
@@ -265,7 +275,7 @@ func TestGroupViewGetAllNodes(t *testing.T) {
 func TestMessageEncodeDecodeAnnounce(t *testing.T) {
 	node := cluster.NodeInfo{
 		NodeID:   "test-node",
-		Host:     "192.168.1.100",
+		IP:       "192.168.1.100",
 		Port:     5000,
 		GroupID:  42,
 		IsLeader: true,
@@ -282,8 +292,8 @@ func TestMessageEncodeDecodeAnnounce(t *testing.T) {
 		t.Errorf("NodeID mismatch: expected %s, got %s", node.NodeID, decoded.NodeID)
 	}
 
-	if decoded.Host != node.Host {
-		t.Errorf("Host mismatch: expected %s, got %s", node.Host, decoded.Host)
+	if decoded.IP != node.IP {
+		t.Errorf("Host mismatch: expected %s, got %s", node.IP, decoded.IP)
 	}
 
 	if decoded.Port != node.Port {
@@ -321,7 +331,7 @@ func TestUpdateHeartbeat(t *testing.T) {
 
 	node := cluster.NodeInfo{
 		NodeID:   "test-node",
-		Host:     "127.0.0.1",
+		IP:       "127.0.0.1",
 		Port:     5000,
 		GroupID:  1,
 		IsLeader: false,

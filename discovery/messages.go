@@ -31,7 +31,7 @@ func DecodeHeartbeat(msg string) (string, error) {
 
 func EncodeAnnounce(node cluster.NodeInfo) string {
 	return fmt.Sprintf("%s|%s|%s|%d|%d|%t",
-		MsgAnnounce, node.NodeID, node.Host, node.Port, node.GroupID, node.IsLeader)
+		MsgAnnounce, node.NodeID, node.IP, node.Port, node.GroupID, node.IsLeader)
 }
 
 func DecodeAnnounce(msg string) (cluster.NodeInfo, error) {
@@ -57,7 +57,7 @@ func DecodeAnnounce(msg string) (cluster.NodeInfo, error) {
 
 	return cluster.NodeInfo{
 		NodeID:   parts[1],
-		Host:     parts[2],
+		IP:       parts[2],
 		Port:     port,
 		GroupID:  groupID,
 		IsLeader: isLeader,
