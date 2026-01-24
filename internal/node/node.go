@@ -1,60 +1,97 @@
 package node
 
 import (
+	"distributed-kv-store/internal/broadcast"
 	"distributed-kv-store/internal/httpserver"
 	"fmt"
+	"log/slog"
 	"net"
+	"os"
 	"sync"
+	"time"
+
+	"github.com/google/uuid"
 )
 
+type NodeInfo struct {
+	ID       uuid.UUID
+	GroupID  uuid.UUID
+	Host     [4]byte
+	Port     uint32
+	IsLeader bool
+}
+
 type Node struct {
+	info          NodeInfo
+	logger        *slog.Logger
 	httpServer    *httpserver.Server
 	store         map[string]string
 	rw            sync.RWMutex
 	groupListener net.Listener
 	isLeader      bool
-	group         map[string]bool // TODO: maybe store heartbeat here
+	group         map[string]bool
 	leaderAddr    string
+	broadcastPort int
 }
 
-func NewNode() *Node {
-	return &Node{
-		httpServer: httpserver.New(),
-		store:      make(map[string]string),
-		rw:         sync.RWMutex{},
-		group:      map[string]bool{},
+func NewNode(httpAddr string, groupAddr string, isLeader bool, group []string, leaderAddr string, broadcastPort int) (*Node, error) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	// TODO: nice error messages
+	httpTcpAddr, err := parseTcp4Addr(httpAddr)
+	if err != nil {
+		return nil, err
 	}
-}
+	groupTcpAddr, err := parseTcp4Addr(groupAddr)
+	if err != nil {
+		return nil, err
+	}
 
-func (n *Node) Init(httpAddr string, groupAddr string, isLeader bool, group []string, leaderAddr string) error {
-	n.isLeader = isLeader
-	n.leaderAddr = leaderAddr
+	n := &Node{
+		info: NodeInfo{
+			ID:       uuid.New(),
+			GroupID:  uuid.Nil,
+			Host:     groupTcpAddr.Host,
+			Port:     groupTcpAddr.Port,
+			IsLeader: false,
+		},
+		logger:        logger,
+		httpServer:    httpserver.New(),
+		store:         make(map[string]string),
+		rw:            sync.RWMutex{},
+		group:         make(map[string]bool),
+		isLeader:      isLeader,
+		leaderAddr:    leaderAddr,
+		broadcastPort: broadcastPort,
+	}
+
+	logger.Info("Starting node with id %s", n.info.ID.String())
 
 	for _, member := range group {
 		n.group[member] = true
 	}
 
-	err := n.httpServer.Bind(httpAddr)
-	if err != nil {
-		return err
+	// Setup HTTP server
+	if err := n.httpServer.Bind(httpTcpAddr.Str); err != nil {
+		return nil, err
 	}
-
 	n.httpServer.RegisterHandler(httpserver.GET, "/kv", n.handleGetKey)
 	n.httpServer.RegisterHandler(httpserver.PUT, "/kv", n.handlePutKey)
 	n.httpServer.RegisterHandler(httpserver.DELETE, "/kv", n.handleDeleteKey)
 
 	go func() {
 		for {
-			err := n.httpServer.Listen()
-			if err != nil {
+			if err := n.httpServer.Listen(); err != nil {
 				fmt.Println("Error in Listen:", err)
 			}
 		}
 	}()
 
-	n.groupListener, err = net.Listen("tcp", groupAddr)
+	// Setup group listener
+	// var err error
+	n.groupListener, err = net.Listen("tcp4", groupAddr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	go func() {
@@ -67,9 +104,26 @@ func (n *Node) Init(httpAddr string, groupAddr string, isLeader bool, group []st
 		}
 	}()
 
-	return nil
-}
+	// Setup broadcast listener
+	go func() {
+		if err := broadcast.Listen(broadcastPort, n.handleBroadcastMessage); err != nil {
+			fmt.Println("Error listening to broadcast: ", err)
+		}
+	}()
 
+	// Send initial broadcast messages
+	go func() {
+		for range 10 {
+			m := BroadcastMessage{
+				Id: n.info.ID,
+			}
+			time.Sleep(time.Second)
+			broadcast.Send(broadcastPort, m.Marshal())
+		}
+	}()
+
+	return n, nil
+}
 func (n *Node) handleGroupMessage(conn net.Conn) {
 	defer conn.Close()
 
@@ -240,3 +294,24 @@ func (n *Node) notifyMembers(data []byte) {
 		}
 	}
 }
+
+func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) error {
+	header := &BroadcastHeader{}
+	if err := header.Unmarshal(buf); err != nil {
+		// TODO: log
+	}
+
+	if header.ID == n.info.ID {
+		return nil
+	}
+
+	// payload := buf[BroadcastHeaderSize:]
+
+	switch header.Type {
+	case BroadcastMessageTypeHeartbeat:
+	}
+
+	return nil
+}
+
+func (n *Node) handleHeartbeat() {}

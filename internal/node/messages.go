@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/google/uuid"
 )
 
 type MessageType byte
@@ -12,11 +14,39 @@ const (
 	MessageTypeHeartbeat     MessageType = 0x01
 	MessageTypeWriteRequest  MessageType = 0x02
 	MessageTypeDeleteRequest MessageType = 0x03
+	MessageTypeBroadcast     MessageType = 0x04
 )
 
 type Message interface {
 	Type() MessageType
 	Marshal() []byte
+}
+
+type BroadcastMessage struct {
+	Id uuid.UUID
+}
+
+func (m *BroadcastMessage) Type() MessageType {
+	return MessageTypeBroadcast
+}
+
+func UnmarshalBroadcastMessage(r io.Reader) (BroadcastMessage, error) {
+	idBuf := make([]byte, 16)
+	if _, err := io.ReadFull(r, idBuf); err != nil {
+		return BroadcastMessage{}, fmt.Errorf("failed to read broadcast ID: %w", err)
+	}
+	var id uuid.UUID
+	copy(id[:], idBuf)
+	return BroadcastMessage{
+		Id: id,
+	}, nil
+}
+
+func (m *BroadcastMessage) Marshal() []byte {
+	buf := make([]byte, 17) // 1 byte type + 16 bytes UUID
+	buf[0] = byte(MessageTypeBroadcast)
+	copy(buf[1:], m.Id[:])
+	return buf
 }
 
 type HeartbeatMessage struct{}
@@ -143,6 +173,16 @@ func Unmarshal(r io.Reader) (Message, error) {
 
 		return &DeleteRequestMessage{
 			Key: key,
+		}, nil
+	case MessageTypeBroadcast:
+		idBuf := make([]byte, 16)
+		if _, err := io.ReadFull(r, idBuf); err != nil {
+			return nil, fmt.Errorf("failed to read broadcast ID: %w", err)
+		}
+		var id uuid.UUID
+		copy(id[:], idBuf)
+		return &BroadcastMessage{
+			Id: id,
 		}, nil
 	default:
 		return nil, fmt.Errorf("unknown message type: 0x%02x", msgType)

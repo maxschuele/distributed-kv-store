@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	distkv "distributed-kv-store/internal/node"
@@ -15,8 +16,17 @@ func main() {
 	isLeader := flag.Bool("leader", false, "Whether this node is the leader")
 	groupMembers := flag.String("members", "", "Comma-separated list of group member addresses (e.g., localhost:8081,localhost:8082)")
 	leaderAddr := flag.String("leader-addr", "", "Address of the leader node (required if not leader)")
+	broadcastPortRaw := flag.String("broadcast-addr", "", "Broadcast port to listen/send on")
 
 	flag.Parse()
+
+	broadcastPort, err := strconv.Atoi(*broadcastPortRaw)
+
+	if err != nil {
+		fmt.Println("Error: -broadcast-port must be a valid integer number: ", err)
+		flag.Usage()
+		os.Exit(1)
+	}
 
 	if !*isLeader && *leaderAddr == "" {
 		fmt.Println("Error: -leader-addr is required when -leader is false")
@@ -32,8 +42,7 @@ func main() {
 		}
 	}
 
-	node := distkv.NewNode()
-	err := node.Init(*httpAddr, *groupAddr, *isLeader, group, *leaderAddr)
+	_, err = distkv.NewNode(*httpAddr, *groupAddr, *isLeader, group, *leaderAddr, broadcastPort)
 	if err != nil {
 		fmt.Printf("Failed to initialize node: %v\n", err)
 		os.Exit(1)

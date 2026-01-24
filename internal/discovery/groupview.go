@@ -1,11 +1,10 @@
 package discovery
 
 import (
+	"distributed-kv-store/internal/node"
 	"log"
 	"sync"
 	"time"
-
-	"github.com/maxschuele/distkv/cluster"
 )
 
 // GroupView maintains knowledge of all discovered nodes in the group
@@ -16,7 +15,7 @@ type GroupView struct {
 
 // NodeRecord stores info about a discovered node
 type NodeRecord struct {
-	Info         cluster.NodeInfo
+	Info         node.NodeInfo
 	LastSeen     time.Time
 	DiscoveredAt time.Time
 }
@@ -29,7 +28,7 @@ func NewGroupView() *GroupView {
 }
 
 // AddOrUpdateNode adds or updates a node in the view
-func (gv *GroupView) AddOrUpdateNode(node cluster.NodeInfo) {
+func (gv *GroupView) AddOrUpdateNode(node node.NodeInfo) {
 	gv.mu.Lock()
 	defer gv.mu.Unlock()
 

@@ -53,7 +53,7 @@ func New() *Server {
 }
 
 func (s *Server) Bind(addr string) error {
-	listener, err := net.Listen("tcp", addr)
+	listener, err := net.Listen("tcp4", addr)
 	s.listener = listener
 	return err
 }
@@ -128,9 +128,9 @@ func parseRequest(conn net.Conn) (*Request, error) {
 	path := fullPath
 	params := make(map[string]string)
 
-	if idx := strings.Index(fullPath, "?"); idx != -1 {
-		path = fullPath[:idx]
-		queryString := fullPath[idx+1:]
+	if before, after, ok := strings.Cut(fullPath, "?"); ok {
+		path = before
+		queryString := after
 
 		pairs := strings.SplitSeq(queryString, "&")
 		for pair := range pairs {
@@ -153,9 +153,9 @@ func parseRequest(conn net.Conn) (*Request, error) {
 		if err != nil || line == "\r\n" {
 			break
 		}
-		if idx := strings.Index(line, ":"); idx != -1 {
-			key := strings.TrimSpace(line[:idx])
-			value := strings.TrimSpace(line[idx+1:])
+		if before, after, ok := strings.Cut(line, ":"); ok {
+			key := strings.TrimSpace(before)
+			value := strings.TrimSpace(after)
 			req.Headers[key] = value
 
 			if strings.ToLower(key) == "content-length" {
@@ -188,15 +188,16 @@ func (w *ResponseWriter) Write(body []byte) error {
 	}
 	w.written = true
 
-	response := fmt.Sprintf("HTTP/1.1 %d %s\r\n", w.statusCode, w.statusText)
+	var response strings.Builder
+	fmt.Fprintf(&response, "HTTP/1.1 %d %s\r\n", w.statusCode, w.statusText)
 	w.headers["Content-Length"] = fmt.Sprintf("%d", len(body))
 
 	for key, value := range w.headers {
-		response += fmt.Sprintf("%s: %s\r\n", key, value)
+		fmt.Fprintf(&response, "%s: %s\r\n", key, value)
 	}
-	response += "\r\n"
+	response.WriteString("\r\n")
 
-	_, err := w.conn.Write([]byte(response))
+	_, err := w.conn.Write([]byte(response.String()))
 	if err != nil {
 		return err
 	}
