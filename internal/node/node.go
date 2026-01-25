@@ -14,11 +14,12 @@ import (
 )
 
 type NodeInfo struct {
-	ID       uuid.UUID
-	GroupID  uuid.UUID
-	Host     [4]byte
-	Port     uint32
-	IsLeader bool
+	ID          uuid.UUID
+	GroupID     uuid.UUID
+	Host        [4]byte
+	Port        uint32
+	IsLeader    bool
+	Participant bool
 }
 
 type Node struct {
