@@ -3,12 +3,10 @@ package node
 import (
 	"distributed-kv-store/internal/broadcast"
 	"distributed-kv-store/internal/httpserver"
+	"distributed-kv-store/internal/logger"
 	"fmt"
-	"log/slog"
 	"net"
-	"os"
 	"sync"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -23,41 +21,45 @@ type NodeInfo struct {
 }
 
 type Node struct {
-	info          NodeInfo
-	logger        *slog.Logger
-	httpServer    *httpserver.Server
-	store         map[string]string
-	rw            sync.RWMutex
-	groupListener net.Listener
-	isLeader      bool
-	group         map[string]bool
-	leaderAddr    string
-	broadcastPort int
+	info            NodeInfo
+	log             *logger.Logger
+	httpServer      *httpserver.Server
+	groupView       *GroupView
+	store           map[string]string
+	rw              sync.RWMutex
+	clusterListener net.Listener
+	isLeader        bool
+	group           map[string]bool
+	leaderAddr      string
+	broadcastPort   int
 }
 
-func NewNode(httpAddr string, groupAddr string, isLeader bool, group []string, leaderAddr string, broadcastPort int) (*Node, error) {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+func NewNode(ip string, httpPort string, clusterPort string, isLeader bool, group []string, leaderAddr string, broadcastPort int) (*Node, error) {
+	log := logger.New(logger.DEBUG)
 
-	// TODO: nice error messages
-	httpTcpAddr, err := parseTcp4Addr(httpAddr)
+	httpAddr, err := parseTcp4Addr(fmt.Sprintf("%s:%s", ip, httpPort))
+
+	log.Info(formatAddress(httpAddr.Host, httpAddr.Port))
+
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid HTTP address: %w", err)
 	}
-	groupTcpAddr, err := parseTcp4Addr(groupAddr)
+	clusterTcpAddr, err := parseTcp4Addr(fmt.Sprintf("%s:%s", ip, clusterPort))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid cluster address: %w", err)
 	}
 
 	n := &Node{
 		info: NodeInfo{
 			ID:       uuid.New(),
 			GroupID:  uuid.Nil,
-			Host:     groupTcpAddr.Host,
-			Port:     groupTcpAddr.Port,
+			Host:     clusterTcpAddr.Host,
+			Port:     clusterTcpAddr.Port,
 			IsLeader: false,
 		},
-		logger:        logger,
+		log:           log,
 		httpServer:    httpserver.New(),
+		groupView:     NewGroupView(log),
 		store:         make(map[string]string),
 		rw:            sync.RWMutex{},
 		group:         make(map[string]bool),
@@ -66,14 +68,12 @@ func NewNode(httpAddr string, groupAddr string, isLeader bool, group []string, l
 		broadcastPort: broadcastPort,
 	}
 
-	logger.Info("Starting node with id %s", n.info.ID.String())
-
 	for _, member := range group {
 		n.group[member] = true
 	}
 
 	// Setup HTTP server
-	if err := n.httpServer.Bind(httpTcpAddr.Str); err != nil {
+	if err := n.httpServer.Bind(httpAddr.Str); err != nil {
 		return nil, err
 	}
 	n.httpServer.RegisterHandler(httpserver.GET, "/kv", n.handleGetKey)
@@ -89,15 +89,14 @@ func NewNode(httpAddr string, groupAddr string, isLeader bool, group []string, l
 	}()
 
 	// Setup group listener
-	// var err error
-	n.groupListener, err = net.Listen("tcp4", groupAddr)
+	n.clusterListener, err = net.Listen("tcp4", clusterTcpAddr.Str)
 	if err != nil {
 		return nil, err
 	}
 
 	go func() {
 		for {
-			conn, err := n.groupListener.Accept()
+			conn, err := n.clusterListener.Accept()
 			if err != nil {
 				fmt.Println("Error accepting connection: ", err)
 			}
@@ -107,24 +106,20 @@ func NewNode(httpAddr string, groupAddr string, isLeader bool, group []string, l
 
 	// Setup broadcast listener
 	go func() {
-		if err := broadcast.Listen(broadcastPort, n.handleBroadcastMessage); err != nil {
+		if err := broadcast.Listen(broadcastPort, n.log, n.handleBroadcastMessage); err != nil {
 			fmt.Println("Error listening to broadcast: ", err)
 		}
 	}()
 
-	// Send initial broadcast messages
-	go func() {
-		for range 10 {
-			m := BroadcastMessage{
-				Id: n.info.ID,
-			}
-			time.Sleep(time.Second)
-			broadcast.Send(broadcastPort, m.Marshal())
-		}
-	}()
+	// Send cluster join message
+	n.sendBroadcastMessage(&BroadcastMessageJoin{
+		Host: n.info.Host,
+		Port: n.info.Port,
+	})
 
 	return n, nil
 }
+
 func (n *Node) handleGroupMessage(conn net.Conn) {
 	defer conn.Close()
 
@@ -162,6 +157,9 @@ func (n *Node) handleGroupMessage(conn net.Conn) {
 			fmt.Println("sending key delete to members")
 			n.deleteNotifyMembers(k)
 		}
+	case *NodeInfoMessage:
+		n.log.Info("received node info message")
+		n.groupView.AddOrUpdateNode(m.Info)
 	}
 
 }
@@ -296,20 +294,60 @@ func (n *Node) notifyMembers(data []byte) {
 	}
 }
 
-func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) error {
+func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 	header := &BroadcastHeader{}
 	if err := header.Unmarshal(buf); err != nil {
-		// TODO: log
+		n.log.Error("failed to unmarshal header: %v", err)
+		return
 	}
 
 	if header.ID == n.info.ID {
-		return nil
+		return
 	}
 
-	// payload := buf[BroadcastHeaderSize:]
+	payload := buf[header.SizeBytes():]
 
 	switch header.Type {
-	case BroadcastMessageTypeHeartbeat:
+	case BroadcastMessageTypeJoin:
+		msg := BroadcastMessageJoin{}
+		if err := msg.Unmarshal(payload); err != nil {
+			n.log.Error("failed to unmarshal payload for join message: %v", err)
+			return
+		}
+
+		m := NodeInfoMessage{
+			Info: n.info,
+		}
+		b := m.Marshal()
+
+		addr := formatAddress(msg.Host, msg.Port)
+		n.log.Info("%s", addr)
+		n.notifyPeer(addr, b)
+	}
+}
+
+func (n *Node) sendTcpMsg(addr string, buf []byte) {
+
+}
+
+func (n *Node) sendBroadcastMessage(m BroadcastMessage) error {
+	h := BroadcastHeader{
+		Type: m.Type(),
+		ID:   n.info.ID,
+	}
+
+	buf := make([]byte, h.SizeBytes()+m.SizeBytes())
+
+	if err := h.Marshal(buf[0:h.SizeBytes()]); err != nil {
+		return err
+	}
+
+	if err := m.Marshal(buf[h.SizeBytes():]); err != nil {
+		return err
+	}
+
+	if err := broadcast.Send(n.broadcastPort, buf); err != nil {
+		return err
 	}
 
 	return nil

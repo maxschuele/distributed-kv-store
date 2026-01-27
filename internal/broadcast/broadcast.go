@@ -1,15 +1,15 @@
 package broadcast
 
 import (
+	"distributed-kv-store/internal/logger"
 	"fmt"
-	"log"
 	"net"
 	"os"
 
 	"golang.org/x/sys/unix"
 )
 
-type BroadcastHandlerFunc func(data []byte, remoteAddr *net.UDPAddr) error
+type BroadcastHandlerFunc func(data []byte, remoteAddr *net.UDPAddr)
 
 const (
 	MaxDatagramSize = 8192
@@ -38,7 +38,7 @@ func Send(port int, pkt []byte) error {
 }
 
 // Listen listens for incoming broadcast announcements
-func Listen(listenPort int, handler BroadcastHandlerFunc) error {
+func Listen(listenPort int, log *logger.Logger, handler BroadcastHandlerFunc) error {
 
 	// Create a socket with SO_REUSEADDR and SO_REUSEPORT set before binding
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
@@ -73,18 +73,15 @@ func Listen(listenPort int, handler BroadcastHandlerFunc) error {
 	defer conn.Close()
 
 	udpConn := conn.(*net.UDPConn)
-	log.Printf("[Discovery] Listening for broadcasts on port %d\n", listenPort)
 
 	buf := make([]byte, MaxDatagramSize)
 	for {
 		n, remoteAddr, err := udpConn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("[Discovery] Error reading UDP: %v\n", err)
+			log.Error("failed to read UDP broadcast message: %v", err)
 			continue
 		}
 
-		if err := handler(buf[:n], remoteAddr); err != nil {
-			log.Printf("[Discovery] Handler error for packet from %v: %v\n", remoteAddr, err)
-		}
+		handler(buf[:n], remoteAddr)
 	}
 }

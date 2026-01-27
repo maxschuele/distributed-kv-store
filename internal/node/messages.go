@@ -12,40 +12,100 @@ type MessageType byte
 
 const (
 	MessageTypeHeartbeat     MessageType = 0x01
-	MessageTypeWriteRequest  MessageType = 0x02
-	MessageTypeDeleteRequest MessageType = 0x03
-	MessageTypeBroadcast     MessageType = 0x04
+	MessageTypeClusterJoin   MessageType = 0x02
+	MessageTypeNodeInfo      MessageType = 0x03
+	MessageTypeWriteRequest  MessageType = 0x04
+	MessageTypeDeleteRequest MessageType = 0x05
 )
 
-type Message interface {
+type MessageHeader struct {
+	Type BroadcastMessageType
+	ID   uuid.UUID
+}
+
+func (h *MessageHeader) SizeBytes() uint { return 17 }
+
+func (h *MessageHeader) Unmarshal(buf []byte) error {
+	if len(buf) < 17 {
+		return NewBufferSizeError(17, len(buf))
+	}
+
+	h.Type = BroadcastMessageType(buf[0])
+	id, err := uuid.FromBytes(buf[1:17])
+	if err != nil {
+		return fmt.Errorf("failed to parse UUID: %w", err)
+	}
+	h.ID = id
+
+	return nil
+}
+
+func (h *MessageHeader) Marshal(buf []byte) error {
+	if len(buf) < 17 {
+		return NewBufferSizeError(17, len(buf))
+	}
+
+	buf[0] = byte(h.Type)
+	copy(buf[1:17], h.ID[:])
+
+	return nil
+}
+
+type TcpMessage interface {
 	Type() MessageType
 	Marshal() []byte
 }
 
-type BroadcastMessage struct {
-	Id uuid.UUID
+type NodeInfoMessage struct {
+	Info NodeInfo
 }
 
-func (m *BroadcastMessage) Type() MessageType {
-	return MessageTypeBroadcast
+func (m *NodeInfoMessage) Type() MessageType {
+	return MessageTypeNodeInfo
 }
 
-func UnmarshalBroadcastMessage(r io.Reader) (BroadcastMessage, error) {
-	idBuf := make([]byte, 16)
-	if _, err := io.ReadFull(r, idBuf); err != nil {
-		return BroadcastMessage{}, fmt.Errorf("failed to read broadcast ID: %w", err)
+func (m *NodeInfoMessage) Marshal() []byte {
+	// Message format:
+	// [1 byte: message type]
+	// [16 bytes: ID UUID]
+	// [16 bytes: GroupID UUID]
+	// [4 bytes: Host]
+	// [4 bytes: Port]
+	// [1 byte: IsLeader]
+	// [1 byte: Participant]
+
+	totalSize := 1 + 16 + 16 + 4 + 4 + 1 + 1 // 43 bytes
+	buf := make([]byte, totalSize)
+
+	offset := 0
+	buf[offset] = byte(MessageTypeNodeInfo)
+	offset += 1
+
+	copy(buf[offset:offset+16], m.Info.ID[:])
+	offset += 16
+
+	copy(buf[offset:offset+16], m.Info.GroupID[:])
+	offset += 16
+
+	copy(buf[offset:offset+4], m.Info.Host[:])
+	offset += 4
+
+	binary.BigEndian.PutUint32(buf[offset:offset+4], m.Info.Port)
+	offset += 4
+
+	if m.Info.IsLeader {
+		buf[offset] = 1
+	} else {
+		buf[offset] = 0
 	}
-	var id uuid.UUID
-	copy(id[:], idBuf)
-	return BroadcastMessage{
-		Id: id,
-	}, nil
-}
+	offset += 1
 
-func (m *BroadcastMessage) Marshal() []byte {
-	buf := make([]byte, 17) // 1 byte type + 16 bytes UUID
-	buf[0] = byte(MessageTypeBroadcast)
-	copy(buf[1:], m.Id[:])
+	if m.Info.Participant {
+		buf[offset] = 1
+	} else {
+		buf[offset] = 0
+	}
+
 	return buf
 }
 
@@ -120,7 +180,7 @@ func (d *DeleteRequestMessage) Marshal() []byte {
 	return buf
 }
 
-func Unmarshal(r io.Reader) (Message, error) {
+func Unmarshal(r io.Reader) (TcpMessage, error) {
 	typeBuf := make([]byte, 1)
 	if _, err := io.ReadFull(r, typeBuf); err != nil {
 		return nil, fmt.Errorf("failed to read message type: %w", err)
@@ -174,16 +234,34 @@ func Unmarshal(r io.Reader) (Message, error) {
 		return &DeleteRequestMessage{
 			Key: key,
 		}, nil
-	case MessageTypeBroadcast:
-		idBuf := make([]byte, 16)
-		if _, err := io.ReadFull(r, idBuf); err != nil {
-			return nil, fmt.Errorf("failed to read broadcast ID: %w", err)
+
+	case MessageTypeNodeInfo:
+		buf := make([]byte, 42) // 16+16+4+4+1+1
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, fmt.Errorf("failed to read node info data: %w", err)
 		}
-		var id uuid.UUID
-		copy(id[:], idBuf)
-		return &BroadcastMessage{
-			Id: id,
-		}, nil
+
+		msg := &NodeInfoMessage{}
+		offset := 0
+
+		copy(msg.Info.ID[:], buf[offset:offset+16])
+		offset += 16
+
+		copy(msg.Info.GroupID[:], buf[offset:offset+16])
+		offset += 16
+
+		copy(msg.Info.Host[:], buf[offset:offset+4])
+		offset += 4
+
+		msg.Info.Port = binary.BigEndian.Uint32(buf[offset : offset+4])
+		offset += 4
+
+		msg.Info.IsLeader = buf[offset] != 0
+		offset += 1
+
+		msg.Info.Participant = buf[offset] != 0
+
+		return msg, nil
 	default:
 		return nil, fmt.Errorf("unknown message type: 0x%02x", msgType)
 	}
