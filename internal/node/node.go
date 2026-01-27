@@ -5,8 +5,10 @@ import (
 	"distributed-kv-store/internal/httpserver"
 	"distributed-kv-store/internal/logger"
 	"fmt"
+	"math/rand"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -32,9 +34,10 @@ type Node struct {
 	group           map[string]bool
 	leaderAddr      string
 	broadcastPort   int
+	groupPort       uint32
 }
 
-func NewNode(ip string, httpPort string, clusterPort string, isLeader bool, group []string, leaderAddr string, broadcastPort int) (*Node, error) {
+func NewNode(ip string, httpPort string, clusterPort string, isLeader bool, group []string, leaderAddr string, broadcastPort int, groupPort uint32) (*Node, error) {
 	log := logger.New(logger.DEBUG)
 
 	httpAddr, err := parseTcp4Addr(fmt.Sprintf("%s:%s", ip, httpPort))
@@ -66,6 +69,7 @@ func NewNode(ip string, httpPort string, clusterPort string, isLeader bool, grou
 		isLeader:      isLeader,
 		leaderAddr:    leaderAddr,
 		broadcastPort: broadcastPort,
+		groupPort:     groupPort,
 	}
 
 	for _, member := range group {
@@ -105,17 +109,39 @@ func NewNode(ip string, httpPort string, clusterPort string, isLeader bool, grou
 	}()
 
 	// Setup broadcast listener
-	go func() {
-		if err := broadcast.Listen(broadcastPort, n.log, n.handleBroadcastMessage); err != nil {
-			fmt.Println("Error listening to broadcast: ", err)
-		}
-	}()
+	// go func() {
+	// 	if err := broadcast.Listen(broadcastPort, n.log, n.handleBroadcastMessage); err != nil {
+	// 		fmt.Println("Error listening to broadcast: ", err)
+	// 	}
+	// }()
 
-	// Send cluster join message
-	n.sendBroadcastMessage(&BroadcastMessageJoin{
+	choices := []int{1, 2, 3, 4, 5}
+	retries := choices[rand.Intn(len(choices))]
+
+	n.log.Info("[Node] Group join: Retry %d times", retries)
+	msg := &BroadcastMessageJoin{
 		Host: n.info.Host,
 		Port: n.info.Port,
-	})
+	}
+
+	// Send cluster join message
+	n.sendBroadcastMessage(msg)
+
+	for i := 0; i < retries; i++ {
+		time.Sleep(1 * time.Second) // possible debug
+
+		// check if node already joined a group
+		n.rw.RLock()
+		joined := n.info.GroupID != uuid.Nil
+		n.rw.RUnlock()
+
+		if joined {
+			break
+		}
+
+		time.Sleep(4 * time.Second)
+		n.sendBroadcastMessage(msg)
+	}
 
 	return n, nil
 }
@@ -162,6 +188,8 @@ func (n *Node) handleGroupMessage(conn net.Conn) {
 		n.groupView.AddOrUpdateNode(m.Info)
 	case *ElectionMessage:
 		n.handleElectionMessage(m)
+	case *ClusterJoinMessage:
+		n.handleClusterJoin(m)
 	}
 
 }
@@ -356,3 +384,17 @@ func (n *Node) sendBroadcastMessage(m BroadcastMessage) error {
 }
 
 func (n *Node) handleHeartbeat() {}
+
+func (n *Node) handleClusterJoin(m *ClusterJoinMessage) {
+	n.rw.Lock()
+	defer n.rw.Unlock()
+
+	// node joins group
+	n.leaderAddr = formatAddress(m.Host, m.Port)
+	n.info.GroupID = m.GroupID
+	n.groupPort = m.GroupPort
+	n.log.Info("[Node] Joining Group with ID %s", n.info.GroupID.String())
+
+	// start listening and heartbeat (TODO)
+
+}

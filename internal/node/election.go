@@ -29,7 +29,6 @@ func (n *Node) handleElectionMessage(msg *ElectionMessage) {
 		n.log.Info("[Election] New Leader Announced: %s", msg.CandidateID)
 
 		n.info.Participant = false
-		// TODO, do we need this? n.isLeader = (CompareUUID(msg.CandidateID, n.info.ID) == 0)
 
 		if !n.isLeader {
 			// Find the leader's address in GroupView
@@ -41,7 +40,6 @@ func (n *Node) handleElectionMessage(msg *ElectionMessage) {
 
 			n.leaderAddr = formatAddress(leaderNode.Host, leaderNode.Port)
 
-			// TODO think if it needs to be go routine
 			go n.forwardElectionMessage(msg)
 		} else {
 			n.leaderAddr = formatAddress(n.info.Host, n.info.Port)

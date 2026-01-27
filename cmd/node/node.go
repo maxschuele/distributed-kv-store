@@ -23,6 +23,9 @@ func main() {
 
 	broadcastPort, err := strconv.Atoi(*broadcastPortRaw)
 
+	// initialize with not used value
+	var groupPort uint32
+
 	if err != nil {
 		fmt.Println("Error: -broadcast-port must be a valid integer number: ", err)
 		flag.Usage()
@@ -43,7 +46,7 @@ func main() {
 		}
 	}
 
-	_, err = distkv.NewNode(*ip, *httpPort, *clusterPort, *isLeader, group, *leaderAddr, broadcastPort)
+	_, err = distkv.NewNode(*ip, *httpPort, *clusterPort, *isLeader, group, *leaderAddr, broadcastPort, groupPort)
 	if err != nil {
 		fmt.Printf("Failed to initialize node: %v\n", err)
 		os.Exit(1)

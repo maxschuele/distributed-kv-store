@@ -75,7 +75,7 @@ func (m *NodeInfoMessage) Marshal() []byte {
 	// [1 byte: IsLeader]
 	// [1 byte: Participant]
 
-	totalSize := 1 + 16 + 16 + 4 + 4 + 1 + 1 // 43 bytes
+	totalSize := 43 // 43 bytes
 	buf := make([]byte, totalSize)
 
 	offset := 0
@@ -143,6 +143,45 @@ func (h *HeartbeatMessage) Type() MessageType {
 
 func (h *HeartbeatMessage) Marshal() []byte {
 	return []byte{byte(MessageTypeHeartbeat)}
+}
+
+type ClusterJoinMessage struct {
+	GroupID   uuid.UUID
+	Host      [4]byte
+	Port      uint32
+	GroupPort uint32
+}
+
+func (h *ClusterJoinMessage) Type() MessageType {
+	return MessageTypeClusterJoin
+}
+
+func (h *ClusterJoinMessage) Marshal() []byte {
+	// Message format:
+	// [1 byte: message type]
+	// [16 bytes: GroupID]
+	// [4 bytes: Host]
+	// [4 bytes: Port]
+	// [4 bytes: GroupPort]
+
+	totalSize := 29 // 29 bytes
+	buf := make([]byte, totalSize)
+
+	offset := 0
+	buf[offset] = byte(MessageTypeClusterJoin)
+	offset += 1
+
+	copy(buf[offset:offset+16], h.GroupID[:])
+	offset += 16
+
+	copy(buf[offset:offset+4], h.Host[:])
+	offset += 4
+
+	binary.BigEndian.PutUint32(buf[offset:offset+4], h.Port)
+	offset += 4
+
+	binary.BigEndian.PutUint32(buf[offset:offset+4], h.GroupPort)
+	return buf
 }
 
 type WriteRequestMessage struct {
@@ -289,7 +328,7 @@ func Unmarshal(r io.Reader) (TcpMessage, error) {
 
 		return msg, nil
 	case MessageTypeElection:
-		buf := make([]byte, 18) // 1 + 16 + 1
+		buf := make([]byte, 17) // 16 + 1
 		if _, err := io.ReadFull(r, buf); err != nil {
 			return nil, fmt.Errorf("failed to read node info data: %w", err)
 		}
@@ -301,7 +340,27 @@ func Unmarshal(r io.Reader) (TcpMessage, error) {
 			CandidateID: id,
 			IsLeader:    buf[16] == 1,
 		}, nil
+	case MessageTypeClusterJoin:
+		buf := make([]byte, 28)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, fmt.Errorf("failed to read node info data: %w", err)
+		}
 
+		msg := &ClusterJoinMessage{}
+		offset := 0
+
+		copy(msg.GroupID[:], buf[offset:offset+16])
+		offset += 16
+
+		copy(msg.Host[:], buf[offset:offset+4])
+		offset += 4
+
+		msg.Port = binary.BigEndian.Uint32(buf[offset : offset+4])
+		offset += 4
+
+		msg.GroupPort = binary.BigEndian.Uint32(buf[offset : offset+4])
+
+		return msg, nil
 	default:
 		return nil, fmt.Errorf("unknown message type: 0x%02x", msgType)
 	}
