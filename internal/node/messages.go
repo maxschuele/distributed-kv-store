@@ -16,6 +16,7 @@ const (
 	MessageTypeNodeInfo      MessageType = 0x03
 	MessageTypeWriteRequest  MessageType = 0x04
 	MessageTypeDeleteRequest MessageType = 0x05
+	MessageTypeElection      MessageType = 0x06
 )
 
 type MessageHeader struct {
@@ -106,6 +107,31 @@ func (m *NodeInfoMessage) Marshal() []byte {
 		buf[offset] = 0
 	}
 
+	return buf
+}
+
+type ElectionMessage struct {
+	CandidateID uuid.UUID
+	IsLeader    bool
+}
+
+func (e *ElectionMessage) Type() MessageType {
+	return MessageTypeElection
+}
+
+func (e *ElectionMessage) Marshal() []byte {
+	// Message Format:
+	// [1 byte: Type]
+	// [16 bytes: UUID]
+	// [1 byte: IsLeader]
+	buf := make([]byte, 18)
+	buf[0] = byte(MessageTypeElection)
+	copy(buf[1:17], e.CandidateID[:])
+	if e.IsLeader {
+		buf[17] = 1
+	} else {
+		buf[17] = 0
+	}
 	return buf
 }
 
@@ -262,6 +288,20 @@ func Unmarshal(r io.Reader) (TcpMessage, error) {
 		msg.Info.Participant = buf[offset] != 0
 
 		return msg, nil
+	case MessageTypeElection:
+		buf := make([]byte, 18) // 1 + 16 + 1
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, fmt.Errorf("failed to read node info data: %w", err)
+		}
+		id, err := uuid.FromBytes(buf[0:16])
+		if err != nil {
+			return nil, fmt.Errorf("invalid uuid: %w", err)
+		}
+		return &ElectionMessage{
+			CandidateID: id,
+			IsLeader:    buf[16] == 1,
+		}, nil
+
 	default:
 		return nil, fmt.Errorf("unknown message type: 0x%02x", msgType)
 	}

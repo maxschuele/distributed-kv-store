@@ -1,7 +1,10 @@
 package node
 
 import (
+	"bytes"
 	"distributed-kv-store/internal/logger"
+	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -63,15 +66,15 @@ func (gv *GroupView) GetNodes() []NodeInfo {
 }
 
 // GetNode returns a specific node by ID
-func (gv *GroupView) GetNode(id uuid.UUID) (NodeInfo, bool) {
+func (gv *GroupView) GetNode(id uuid.UUID) (NodeInfo, error) {
 	gv.mu.RLock()
 	defer gv.mu.RUnlock()
 
 	record, exists := gv.nodes[id]
 	if !exists {
-		return NodeInfo{}, false
+		return NodeInfo{}, fmt.Errorf("[GroupView] No entry for Node with UUID %s found", id.String())
 	}
-	return record.Info, true
+	return record.Info, nil
 }
 
 // RemoveStaleNodes removes nodes that haven't been seen in timeout duration
@@ -121,4 +124,37 @@ func (gv *GroupView) UpdateHeartbeat(id uuid.UUID) {
 	if record, exists := gv.nodes[id]; exists {
 		record.LastSeen = time.Now()
 	}
+}
+
+// SortNodesByID returns a list of nodes sorted by their UUIDs
+func (gv *GroupView) SortNodesByID() []NodeInfo {
+	gv.mu.RLock()
+	defer gv.mu.RUnlock()
+
+	ids := make([]uuid.UUID, 0, len(gv.nodes))
+	for id := range gv.nodes {
+		ids = append(ids, id)
+	}
+	// Sort UUIDs
+	sort.Slice(ids, func(i, j int) bool {
+		return bytes.Compare(ids[i][:], ids[j][:]) < 0
+	})
+
+	sortedNodes := make([]NodeInfo, 0, len(gv.nodes))
+	for _, id := range ids {
+		sortedNodes = append(sortedNodes, gv.nodes[id].Info)
+	}
+	return sortedNodes
+}
+
+// GetSuccessor returns the successor node of the given node ID
+func (gv *GroupView) GetSuccessor(id uuid.UUID) (NodeInfo, error) {
+	sortedNodes := gv.SortNodesByID()
+	for i, node := range sortedNodes {
+		if node.ID == id {
+			successorIndex := (i + 1) % len(sortedNodes)
+			return sortedNodes[successorIndex], nil
+		}
+	}
+	return NodeInfo{}, fmt.Errorf("[GroupView] No Successor found for node with uuid: %s", id.String())
 }

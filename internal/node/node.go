@@ -160,6 +160,8 @@ func (n *Node) handleGroupMessage(conn net.Conn) {
 	case *NodeInfoMessage:
 		n.log.Info("received node info message")
 		n.groupView.AddOrUpdateNode(m.Info)
+	case *ElectionMessage:
+		n.handleElectionMessage(m)
 	}
 
 }
