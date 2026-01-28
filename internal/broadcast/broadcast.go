@@ -13,11 +13,12 @@ type BroadcastHandlerFunc func(data []byte, remoteAddr *net.UDPAddr)
 
 const (
 	MaxDatagramSize = 8192
+	IPv4Broadcast  = "255.255.255.255"
 )
 
 // Broadcast sends an announcement message to the broadcast address
 func Send(port int, pkt []byte) error {
-	broadcastAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("255.255.255.255:%d", port))
+	broadcastAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", IPv4Broadcast, port))
 	if err != nil {
 		return err
 	}

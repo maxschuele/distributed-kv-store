@@ -135,14 +135,57 @@ func (e *ElectionMessage) Marshal() []byte {
 	return buf
 }
 
-type HeartbeatMessage struct{}
+type HeartbeatMessage struct {
+	Info NodeInfo
+}
 
 func (h *HeartbeatMessage) Type() MessageType {
 	return MessageTypeHeartbeat
 }
 
 func (h *HeartbeatMessage) Marshal() []byte {
-	return []byte{byte(MessageTypeHeartbeat)}
+	// Message format:
+	// [1 byte: message type]
+	// [16 bytes: ID UUID]
+	// [16 bytes: GroupID UUID]
+	// [4 bytes: Host]
+	// [4 bytes: Port]
+	// [1 byte: IsLeader]
+	// [1 byte: Participant]
+
+	totalSize := 43 // 43 bytes
+	buf := make([]byte, totalSize)
+
+	offset := 0
+	buf[offset] = byte(MessageTypeHeartbeat)
+	offset += 1
+
+	copy(buf[offset:offset+16], h.Info.ID[:])
+	offset += 16
+
+	copy(buf[offset:offset+16], h.Info.GroupID[:])
+	offset += 16
+
+	copy(buf[offset:offset+4], h.Info.Host[:])
+	offset += 4
+
+	binary.BigEndian.PutUint32(buf[offset:offset+4], h.Info.Port)
+	offset += 4
+
+	if h.Info.IsLeader {
+		buf[offset] = 1
+	} else {
+		buf[offset] = 0
+	}
+	offset += 1
+
+	if h.Info.Participant {
+		buf[offset] = 1
+	} else {
+		buf[offset] = 0
+	}
+
+	return buf
 }
 
 type ClusterJoinMessage struct {

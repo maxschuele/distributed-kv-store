@@ -116,6 +116,9 @@ func (gv *GroupView) StartHeartbeatMonitor(timeout time.Duration, checkInterval 
 	}()
 }
 
+/*
+-----NOT NECESSARY------
+*/
 // UpdateHeartbeat updates the last-seen time without changing node info
 func (gv *GroupView) UpdateHeartbeat(id uuid.UUID) {
 	gv.mu.Lock()

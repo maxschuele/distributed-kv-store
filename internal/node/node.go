@@ -13,6 +13,12 @@ import (
 	"github.com/google/uuid"
 )
 
+const (
+	HeartbeatInterval = 5 * time.Second
+	HeartbeatTimeout  = 15 * time.Second
+	GroupSizeThreshold = 3
+)
+
 type NodeInfo struct {
 	ID          uuid.UUID
 	GroupID     uuid.UUID
@@ -72,6 +78,9 @@ func NewNode(ip string, httpPort string, clusterPort string, isLeader bool, grou
 		groupPort:     groupPort,
 	}
 
+	// Start heartbeat monitor
+	go n.groupView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval)
+
 	for _, member := range group {
 		n.group[member] = true
 	}
@@ -115,6 +124,12 @@ func NewNode(ip string, httpPort string, clusterPort string, isLeader bool, grou
 	// 	}
 	// }()
 
+	go n.initiateJoinProcess()
+
+	return n, nil
+}
+
+func (n *Node) initiateJoinProcess() {
 	choices := []int{1, 2, 3, 4, 5}
 	retries := choices[rand.Intn(len(choices))]
 
@@ -136,14 +151,28 @@ func NewNode(ip string, httpPort string, clusterPort string, isLeader bool, grou
 		n.rw.RUnlock()
 
 		if joined {
-			break
+			return
 		}
 
 		time.Sleep(4 * time.Second)
 		n.sendBroadcastMessage(msg)
 	}
 
-	return n, nil
+	// if no group found start a new group/cluster
+	n.startNewCluster()
+}
+
+func (n *Node) startNewCluster() {
+	n.rw.Lock()
+	defer n.rw.Unlock()
+	
+	n.info.GroupID = uuid.New()
+	n.info.IsLeader = true
+	n.isLeader = true
+	n.leaderAddr = formatAddress(n.info.Host, n.info.Port)
+
+	n.log.Info("[Node] Became leader of new group %s", n.info.GroupID.String())
+	n.startListenAndSendHeartbeats()
 }
 
 func (n *Node) handleGroupMessage(conn net.Conn) {
@@ -158,8 +187,8 @@ func (n *Node) handleGroupMessage(conn net.Conn) {
 
 	switch m := msg.(type) {
 	case *HeartbeatMessage:
-		// TODO
-		break
+		n.handleHeartbeat(m.Info)
+		
 	case *WriteRequestMessage:
 		fmt.Println("received group write key message")
 		k := string(m.Key)
@@ -172,6 +201,7 @@ func (n *Node) handleGroupMessage(conn net.Conn) {
 			fmt.Println("sending key to members")
 			n.writeNotifyMembers(k, v)
 		}
+
 	case *DeleteRequestMessage:
 		fmt.Println("received group delete key message")
 		k := string(m.Key)
@@ -183,11 +213,24 @@ func (n *Node) handleGroupMessage(conn net.Conn) {
 			fmt.Println("sending key delete to members")
 			n.deleteNotifyMembers(k)
 		}
+
 	case *NodeInfoMessage:
 		n.log.Info("received node info message")
-		n.groupView.AddOrUpdateNode(m.Info)
+		if n.isLeader {
+			// if m.isLeader {
+			// 	n.groupView.AddOrUpdateNode(m.Info)
+			// 	return
+			// }
+			
+			if getClusterSize() < GroupSizeThreshold {
+				n.groupView.AddOrUpdateNode(m.Info)
+				n.sendCluserInviteMessage() 			// TODO function
+			}
+		}
+
 	case *ElectionMessage:
 		n.handleElectionMessage(m)
+
 	case *ClusterJoinMessage:
 		n.handleClusterJoin(m)
 	}
@@ -357,7 +400,7 @@ func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 }
 
 func (n *Node) sendTcpMsg(addr string, buf []byte) {
-
+	//TODO ?
 }
 
 func (n *Node) sendBroadcastMessage(m BroadcastMessage) error {
@@ -383,7 +426,23 @@ func (n *Node) sendBroadcastMessage(m BroadcastMessage) error {
 	return nil
 }
 
-func (n *Node) handleHeartbeat() {}
+func (n *Node) StartHeartbeat() {
+	hb := HeartbeatMessage{
+		Info: n.info,
+	}
+	
+	for true {
+		if n.isLeader {
+			go broadcast.Send(int(n.broadcastPort), hb)
+		}
+		go broadcast.Send(int(n.groupPort), hb)
+		time.Sleep(HeartbeatInterval)
+	}
+}
+
+func (n *Node) handleHeartbeat(m *HeartbeatMessage) {
+	n.groupView.AddOrUpdateNode(m.Info)
+}
 
 func (n *Node) handleClusterJoin(m *ClusterJoinMessage) {
 	n.rw.Lock()
@@ -394,7 +453,27 @@ func (n *Node) handleClusterJoin(m *ClusterJoinMessage) {
 	n.info.GroupID = m.GroupID
 	n.groupPort = m.GroupPort
 	n.log.Info("[Node] Joining Group with ID %s", n.info.GroupID.String())
+	n.startListenAndSendHeartbeats()
+	
+	
+}
 
-	// start listening and heartbeat (TODO)
+func (n *Node) startListenAndSendHeartbeats() {
+	go broadcast.Listen(int(n.groupPort), n.log, n.handleBroadcastMessage)
+	go n.StartHeartbeat()
+}
 
+// GetClusterSize returns the number of nodes in the group view with the same GroupID
+func (n *Node) getClusterSize() int	{
+	count := 0
+	n.groupView.rw.RLock()
+	defer n.groupView.rw.RUnlock()
+
+	for _, node := range n.groupView.nodes {
+		if node.Info.GroupID == n.info.GroupID {
+			count++
+		}
+	}
+
+	return count
 }
