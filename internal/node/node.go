@@ -222,9 +222,9 @@ func (n *Node) handleGroupMessage(conn net.Conn) {
 			// 	return
 			// }
 			
-			if getClusterSize() < GroupSizeThreshold {
+			if n.getClusterSize() < GroupSizeThreshold {
 				n.groupView.AddOrUpdateNode(m.Info)
-				n.sendCluserInviteMessage() 			// TODO function
+				n.sendClusterInviteMessage(m.Info)
 			}
 		}
 
@@ -463,8 +463,25 @@ func (n *Node) startListenAndSendHeartbeats() {
 	go n.StartHeartbeat()
 }
 
+// sendClusterInviteMessage sends a ClusterJoinMessage to invite a node to join this cluster
+func (n *Node) sendClusterInviteMessage(info NodeInfo) {
+	msg := &ClusterJoinMessage{
+		GroupID:   n.info.GroupID,
+		Host:      n.info.Host,
+		Port:      n.info.Port,
+		GroupPort: n.groupPort,
+	}
+
+	addr := formatAddress(info.Host, info.Port)
+	if err := n.notifyPeer(addr, msg.Marshal()); err != nil {
+		n.log.Error("[Node] Failed to send cluster invite to %s: %v", addr, err)
+	} else {
+		n.log.Info("[Node] Sent cluster invite to %s for group %s", addr, n.info.GroupID.String())
+	}
+}
+
 // GetClusterSize returns the number of nodes in the group view with the same GroupID
-func (n *Node) getClusterSize() int	{
+func (n *Node) getClusterSize() int {
 	count := 0
 	n.groupView.rw.RLock()
 	defer n.groupView.rw.RUnlock()
