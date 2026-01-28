@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	HeartbeatInterval = 5 * time.Second
-	HeartbeatTimeout  = 15 * time.Second
+	HeartbeatInterval  = 5 * time.Second
+	HeartbeatTimeout   = 15 * time.Second
 	GroupSizeThreshold = 3
 )
 
@@ -165,7 +165,7 @@ func (n *Node) initiateJoinProcess() {
 func (n *Node) startNewCluster() {
 	n.rw.Lock()
 	defer n.rw.Unlock()
-	
+
 	n.info.GroupID = uuid.New()
 	n.info.IsLeader = true
 	n.isLeader = true
@@ -187,8 +187,8 @@ func (n *Node) handleGroupMessage(conn net.Conn) {
 
 	switch m := msg.(type) {
 	case *HeartbeatMessage:
-		n.handleHeartbeat(m.Info)
-		
+		n.handleHeartbeat(m)
+
 	case *WriteRequestMessage:
 		fmt.Println("received group write key message")
 		k := string(m.Key)
@@ -221,7 +221,7 @@ func (n *Node) handleGroupMessage(conn net.Conn) {
 			// 	n.groupView.AddOrUpdateNode(m.Info)
 			// 	return
 			// }
-			
+
 			if n.getClusterSize() < GroupSizeThreshold {
 				n.groupView.AddOrUpdateNode(m.Info)
 				n.sendClusterInviteMessage(m.Info)
@@ -427,15 +427,19 @@ func (n *Node) sendBroadcastMessage(m BroadcastMessage) error {
 }
 
 func (n *Node) StartHeartbeat() {
-	hb := HeartbeatMessage{
-		Info: n.info,
-	}
-	
-	for true {
+	for {
+		hb := &HeartbeatMessage{Info: n.info}
+		data := hb.Marshal()
+
 		if n.isLeader {
-			go broadcast.Send(int(n.broadcastPort), hb)
+			if err := broadcast.Send(n.broadcastPort, data); err != nil {
+				n.log.Error("[Heartbeat] broadcast send failed: %v", err)
+			}
 		}
-		go broadcast.Send(int(n.groupPort), hb)
+		if err := broadcast.Send(int(n.groupPort), data); err != nil {
+			n.log.Error("[Heartbeat] group send failed: %v", err)
+		}
+
 		time.Sleep(HeartbeatInterval)
 	}
 }
@@ -454,8 +458,7 @@ func (n *Node) handleClusterJoin(m *ClusterJoinMessage) {
 	n.groupPort = m.GroupPort
 	n.log.Info("[Node] Joining Group with ID %s", n.info.GroupID.String())
 	n.startListenAndSendHeartbeats()
-	
-	
+
 }
 
 func (n *Node) startListenAndSendHeartbeats() {
@@ -483,8 +486,9 @@ func (n *Node) sendClusterInviteMessage(info NodeInfo) {
 // GetClusterSize returns the number of nodes in the group view with the same GroupID
 func (n *Node) getClusterSize() int {
 	count := 0
-	n.groupView.rw.RLock()
-	defer n.groupView.rw.RUnlock()
+	gv := n.groupView
+	gv.mu.RLock()
+	defer gv.mu.RUnlock()
 
 	for _, node := range n.groupView.nodes {
 		if node.Info.GroupID == n.info.GroupID {
