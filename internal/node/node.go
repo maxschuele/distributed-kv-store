@@ -48,7 +48,7 @@ func NewNode(ip string, httpPort string, clusterPort string, isLeader bool, grou
 
 	httpAddr, err := parseTcp4Addr(fmt.Sprintf("%s:%s", ip, httpPort))
 
-	log.Info(formatAddress(httpAddr.Host, httpAddr.Port))
+	log.Info("[Node] HTTP address: %s", formatAddress(httpAddr.Host, httpAddr.Port))
 
 	if err != nil {
 		return nil, fmt.Errorf("invalid HTTP address: %w", err)
@@ -96,7 +96,7 @@ func NewNode(ip string, httpPort string, clusterPort string, isLeader bool, grou
 	go func() {
 		for {
 			if err := n.httpServer.Listen(); err != nil {
-				fmt.Println("Error in Listen:", err)
+				n.log.Error("[Node] Error in HTTP Listen: %v", err)
 			}
 		}
 	}()
@@ -111,7 +111,7 @@ func NewNode(ip string, httpPort string, clusterPort string, isLeader bool, grou
 		for {
 			conn, err := n.clusterListener.Accept()
 			if err != nil {
-				fmt.Println("Error accepting connection: ", err)
+				n.log.Error("[Node] Error accepting connection: %v", err)
 			}
 			go n.handleGroupMessage(conn)
 		}
@@ -181,7 +181,7 @@ func (n *Node) handleGroupMessage(conn net.Conn) {
 	msg, err := Unmarshal(conn)
 	if err != nil {
 		// TODO
-		fmt.Println("failed to unmarshal group message")
+		n.log.Error("[Node] Failed to unmarshal group message: %v", err)
 		return
 	}
 
@@ -190,7 +190,7 @@ func (n *Node) handleGroupMessage(conn net.Conn) {
 		n.handleHeartbeat(m)
 
 	case *WriteRequestMessage:
-		fmt.Println("received group write key message")
+		n.log.Info("[Node] Received group write key message")
 		k := string(m.Key)
 		v := string(m.Value)
 		n.rw.Lock()
@@ -198,24 +198,24 @@ func (n *Node) handleGroupMessage(conn net.Conn) {
 		n.rw.Unlock()
 
 		if n.isLeader {
-			fmt.Println("sending key to members")
+			n.log.Info("[Node] Sending key %s with value %s to members", k, v)
 			n.writeNotifyMembers(k, v)
 		}
 
 	case *DeleteRequestMessage:
-		fmt.Println("received group delete key message")
 		k := string(m.Key)
+		n.log.Info("[Node] Received group delete for key %s", k)
 		n.rw.Lock()
 		delete(n.store, k)
 		n.rw.Unlock()
 
 		if n.isLeader {
-			fmt.Println("sending key delete to members")
+			n.log.Info("[Node] Sending delete for key %s to members", k)
 			n.deleteNotifyMembers(k)
 		}
 
 	case *NodeInfoMessage:
-		n.log.Info("received node info message")
+		n.log.Info("[Node] Received node info message")
 		if n.isLeader {
 			// if m.isLeader {
 			// 	n.groupView.AddOrUpdateNode(m.Info)
@@ -345,7 +345,7 @@ func (n *Node) deleteNotifyMembers(key string) error {
 func (n *Node) notifyPeer(addr string, data []byte) error {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
-		fmt.Println("conn to peer failed")
+		n.log.Error("[Node] Connection to peer failed: %v", err)
 		return err
 	}
 	defer conn.Close()
@@ -353,7 +353,7 @@ func (n *Node) notifyPeer(addr string, data []byte) error {
 	// TODO: set a timeout, handle partial write
 	_, err = conn.Write(data)
 	if err != nil {
-		fmt.Println("write to peer failed")
+		n.log.Error("[Node] Write to peer failed: %v", err)
 		return err
 	}
 	return nil
@@ -370,7 +370,7 @@ func (n *Node) notifyMembers(data []byte) {
 func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 	header := &BroadcastHeader{}
 	if err := header.Unmarshal(buf); err != nil {
-		n.log.Error("failed to unmarshal header: %v", err)
+		n.log.Error("[Node] Failed to unmarshal header: %v", err)
 		return
 	}
 
@@ -384,7 +384,7 @@ func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 	case BroadcastMessageTypeJoin:
 		msg := BroadcastMessageJoin{}
 		if err := msg.Unmarshal(payload); err != nil {
-			n.log.Error("failed to unmarshal payload for join message: %v", err)
+			n.log.Error("[Node] Failed to unmarshal payload for join message: %v", err)
 			return
 		}
 
@@ -394,7 +394,7 @@ func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 		b := m.Marshal()
 
 		addr := formatAddress(msg.Host, msg.Port)
-		n.log.Info("%s", addr)
+		n.log.Info("[Node] Notifying peer at %s", addr)
 		n.notifyPeer(addr, b)
 	}
 }
