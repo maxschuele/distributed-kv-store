@@ -1,11 +1,12 @@
 package node
 
 import (
+	"context"
 	"distributed-kv-store/internal/broadcast"
 	"distributed-kv-store/internal/httpserver"
 	"distributed-kv-store/internal/logger"
 	"fmt"
-	"math/rand"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -14,16 +15,15 @@ import (
 )
 
 const (
-	HeartbeatInterval  = 5 * time.Second
-	HeartbeatTimeout   = 15 * time.Second
-	GroupSizeThreshold = 3
+	HeartbeatInterval = 2 * time.Second
+	HeartbeatTimeout  = 8 * time.Second
 )
 
 type NodeInfo struct {
 	ID          uuid.UUID
 	GroupID     uuid.UUID
 	Host        [4]byte
-	Port        uint32
+	Port        uint16
 	IsLeader    bool
 	Participant bool
 }
@@ -32,209 +32,406 @@ type Node struct {
 	info            NodeInfo
 	log             *logger.Logger
 	httpServer      *httpserver.Server
-	groupView       *GroupView
-	store           map[string]string
+	clusterView     *GroupView
+	replicationView *GroupView
+	clusterListener *net.TCPListener
+	storage         *Storage
 	rw              sync.RWMutex
-	clusterListener net.Listener
-	isLeader        bool
-	group           map[string]bool
 	leaderAddr      string
-	broadcastPort   int
-	groupPort       uint32
+	broadcastPort   uint16
+	groupPort       uint16
 }
 
-func NewNode(ip string, httpPort string, clusterPort string, isLeader bool, group []string, leaderAddr string, broadcastPort int, groupPort uint32) (*Node, error) {
+func StartNode(ip string, httpPort uint16, clusterPort uint16, groupPort uint16, broadcastPort uint16) {
 	log := logger.New(logger.DEBUG)
 
-	httpAddr, err := parseTcp4Addr(fmt.Sprintf("%s:%s", ip, httpPort))
-
-	log.Info("[Node] HTTP address: %s", formatAddress(httpAddr.Host, httpAddr.Port))
-
+	clusterTcpAddr, err := parseTcp4Addr(fmt.Sprintf("%s:%d", ip, clusterPort))
 	if err != nil {
-		return nil, fmt.Errorf("invalid HTTP address: %w", err)
+		log.Fatal("invalid cluster address: %v", err)
 	}
-	clusterTcpAddr, err := parseTcp4Addr(fmt.Sprintf("%s:%s", ip, clusterPort))
-	if err != nil {
-		return nil, fmt.Errorf("invalid cluster address: %w", err)
+
+	info := NodeInfo{
+		ID:       uuid.New(),
+		GroupID:  uuid.Nil,
+		Host:     clusterTcpAddr.Host,
+		Port:     clusterTcpAddr.Port,
+		IsLeader: true,
 	}
+
+	log.Info("starting node %s", info.ID.String())
 
 	n := &Node{
-		info: NodeInfo{
-			ID:       uuid.New(),
-			GroupID:  uuid.Nil,
-			Host:     clusterTcpAddr.Host,
-			Port:     clusterTcpAddr.Port,
-			IsLeader: false,
-		},
+		info:          info,
 		log:           log,
 		httpServer:    httpserver.New(),
-		groupView:     NewGroupView(log),
-		store:         make(map[string]string),
+		clusterView:   NewGroupView(log),
+		storage:       NewStorage(),
 		rw:            sync.RWMutex{},
-		group:         make(map[string]bool),
-		isLeader:      isLeader,
-		leaderAddr:    leaderAddr,
 		broadcastPort: broadcastPort,
 		groupPort:     groupPort,
 	}
 
-	// Start heartbeat monitor
-	go n.groupView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval)
-
-	for _, member := range group {
-		n.group[member] = true
+	n.clusterListener, err = net.ListenTCP("tcp4", clusterTcpAddr.Addr)
+	if err != nil {
+		log.Fatal("failed to set up cluster listener: %v", err)
 	}
 
-	// Setup HTTP server
-	if err := n.httpServer.Bind(httpAddr.Str); err != nil {
-		return nil, err
+	go n.listenClusterMessages()
+
+	go func() {
+		if err := broadcast.Listen(broadcastPort, n.log, n.handleBroadcastMessage); err != nil {
+			n.log.Fatal("Error listening to broadcast: %v", err)
+		}
+	}()
+
+	go n.sendClusterHeartbeats()
+
+	// TODO: add this back in
+	// Start heartbeat monitor
+	go n.clusterView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval)
+	// go n.startHttpServer(ip, httpPort)
+}
+
+func StartReplicationNode(ip string, clusterPort uint16, broadcastPort uint16) {
+	log := logger.New(logger.DEBUG)
+
+	clusterTcpAddr, err := parseTcp4Addr(fmt.Sprintf("%s:%d", ip, clusterPort))
+	if err != nil {
+		log.Fatal("invalid cluster address: %v", err)
+	}
+
+	info := NodeInfo{
+		ID:       uuid.New(),
+		GroupID:  uuid.Nil,
+		Host:     clusterTcpAddr.Host,
+		Port:     clusterTcpAddr.Port,
+		IsLeader: false,
+	}
+
+	n := &Node{
+		info:          info,
+		log:           log,
+		storage:       NewStorage(),
+		rw:            sync.RWMutex{},
+		broadcastPort: broadcastPort,
+	}
+
+	n.clusterListener, err = net.ListenTCP("tcp4", clusterTcpAddr.Addr)
+	if err != nil {
+		log.Fatal("failed to set up cluster listener: %v", err)
+	}
+
+	joined := false
+	for !joined {
+		joined = n.groupJoin()
+	}
+
+	go n.listenClusterMessages()
+}
+
+func (n *Node) listenClusterMessages() {
+	for {
+		conn, err := n.clusterListener.Accept()
+		if err != nil {
+			n.log.Error("Error accepting cluster tcp connection: %v", err)
+		}
+		go n.handleClusterMessage(conn)
+		conn.Close()
+	}
+}
+
+func (n *Node) handleClusterMessage(conn net.Conn) {
+
+}
+
+func (n *Node) sendClusterHeartbeats() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	header := MessageHeader{
+		Type: MessageTypeHeartbeat,
+		ID:   n.info.ID,
+	}
+	msg := MessageHeartbeat{
+		Info: n.info,
+	}
+	buf := make([]byte, header.SizeBytes()+msg.SizeBytes())
+
+	if err := header.Marshal(buf); err != nil {
+		n.log.Fatal("failed to marshal heartbeat header: %v", err)
+	}
+
+	if err := msg.Marshal(buf[header.SizeBytes():]); err != nil {
+		n.log.Fatal("failed to marshal heartbeat message: %v", err)
+	}
+
+	for {
+		if err := broadcast.Send(n.broadcastPort, buf); err != nil {
+			n.log.Error("failed to broadcast heartbeat message: %v", err)
+		}
+		<-ticker.C
+	}
+}
+
+func (n *Node) sendTcpMessage(addr string, data []byte) error {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		n.log.Error("[Node] Connection to peer failed: %v", err)
+		return err
+	}
+	defer conn.Close()
+
+	// TODO: set a timeout, handle partial write
+	_, err = conn.Write(data)
+	if err != nil {
+		n.log.Error("[Node] Write to peer failed: %v", err)
+		return err
+	}
+	return nil
+}
+
+func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
+	if !isNodeMessage(buf) {
+		n.log.Debug("got non node message")
+		return
+	}
+
+	header := &MessageHeader{}
+	if err := header.Unmarshal(buf); err != nil {
+		n.log.Error("[Node] Failed to unmarshal header: %v", err)
+		return
+	}
+
+	if header.ID == n.info.ID {
+		return
+	}
+
+	payload := buf[header.SizeBytes():]
+
+	switch header.Type {
+	case MessageTypeHeartbeat:
+		msg := MessageHeartbeat{}
+		if err := msg.Unmarshal(payload); err != nil {
+			n.log.Error("Failed to unmarshal cluster heartbeat: %v", err)
+			return
+		}
+
+		n.clusterView.AddOrUpdateNode(msg.Info)
+	case MessageTypeGroupJoin:
+		if !n.info.IsLeader {
+			return
+		}
+
+		msg := MessageGroupJoin{}
+		if err := msg.Unmarshal(payload); err != nil {
+			n.log.Error("Failed to unmarshal group join message: %v", err)
+			return
+		}
+
+		// outHeader := &MessageHeader{
+		// 	ID:   n.info.ID,
+		// 	Type: MessageTypeGroupJoin,
+		// }
+		// outMsg := MessageGroupInfo{
+		// 	GroupID:    n.info.GroupID,
+		// 	GroupSize:  1,
+		// 	LeaderHost: n.info.Host,
+		// 	Port:       n.info.Port,
+		// }
+		// outBuf := make([]byte, outHeader.SizeBytes()+outMsg.SizeBytes())
+		// if err := outHeader.Marshal(outBuf); err != nil {
+		// 	n.log.Error("Failed to marshal message header: %v", err)
+		// 	return
+		// }
+		// if err := outMsg.Marshal(outBuf[outHeader.SizeBytes():]); err != nil {
+		// 	n.log.Error("Failed to marshal group info message: %v", err)
+		// }
+
+		n.sendMsg(formatAddress(msg.Host, msg.Port), &MessageGroupInfo{
+			GroupID:    n.info.GroupID,
+			GroupSize:  1,
+			LeaderHost: n.info.Host,
+			Port:       n.info.Port,
+		})
+	}
+}
+
+func (n *Node) sendMsg(addr string, m Message) error {
+	h := MessageHeader{
+		ID:   n.info.ID,
+		Type: m.Type(),
+	}
+
+	buf := make([]byte, h.SizeBytes()+m.SizeBytes())
+
+	if err := h.Marshal(buf); err != nil {
+		return err
+	}
+
+	if err := m.Marshal(buf[h.SizeBytes():]); err != nil {
+		return err
+	}
+
+	if err := n.sendTcpMessage(addr, buf); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (n *Node) groupJoin() bool {
+	responses := make(map[uuid.UUID]MessageGroupInfo)
+	mu := sync.Mutex{}
+	wg := sync.WaitGroup{}
+
+	// Start listener with timeout
+	timeout := 5 * time.Second
+	deadline := time.Now().Add(timeout)
+	n.clusterListener.SetDeadline(deadline)
+	defer n.clusterListener.SetDeadline(time.Time{})
+
+	// Accept connections in background
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	go func() {
+		header := MessageHeader{}
+		msg := MessageGroupInfo{}
+
+		for time.Now().Before(deadline) {
+			conn, err := n.clusterListener.Accept()
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					return
+				}
+				n.log.Error("failed to accept connection: %v", err)
+				return
+			}
+
+			wg.Add(1)
+			go func(c net.Conn) {
+				n.log.Info("got messasge")
+				defer wg.Done()
+				defer c.Close()
+
+				buf := make([]byte, header.SizeBytes()+msg.SizeBytes())
+
+				// Read magic
+				if _, err := io.ReadFull(c, buf[0:4]); err != nil {
+					n.log.Error("failed to read magic: %v", err)
+					return
+				}
+				if !isNodeMessage(buf) {
+					n.log.Info("not node message")
+					return
+				}
+
+				// Read rest of header
+				if _, err := io.ReadFull(c, buf[4:header.SizeBytes()]); err != nil {
+					n.log.Error("failed to read header: %v", err)
+					return
+				}
+				if err := header.Unmarshal(buf); err != nil {
+					n.log.Error("failed to unmarshal header: %v", err)
+					return
+				}
+				if header.Type != MessageTypeGroupInfo {
+					n.log.Info("not group info")
+					return
+				}
+
+				// Read message body
+				if _, err := io.ReadFull(c, buf[header.SizeBytes():header.SizeBytes()+msg.SizeBytes()]); err != nil {
+					n.log.Error("failed to read message body: %v", err)
+					return
+				}
+				if err := msg.Unmarshal(buf[header.SizeBytes():]); err != nil {
+					n.log.Error("failed to unmarshal group info: %v", err)
+					return
+				}
+
+				n.log.Info("got group info from %s", header.ID)
+				mu.Lock()
+				responses[header.ID] = msg
+				mu.Unlock()
+			}(conn)
+		}
+	}()
+
+	// Broadcast join request
+	h := MessageHeader{
+		ID:   n.info.ID,
+		Type: MessageTypeGroupJoin,
+	}
+	m := MessageGroupJoin{
+		Host: n.info.Host,
+		Port: n.info.Port,
+	}
+	buf := make([]byte, h.SizeBytes()+m.SizeBytes())
+	if err := h.Marshal(buf); err != nil {
+		n.log.Error("failed to marshal broadcast header: %v", err)
+		return false
+	}
+	if err := m.Marshal(buf[h.SizeBytes():]); err != nil {
+		n.log.Error("failed to marshal group join message: %v", err)
+		return false
+	}
+
+	for range 4 {
+		if err := broadcast.Send(n.broadcastPort, buf); err != nil {
+			n.log.Error("failed to send group join broadcast message: %v", err)
+		}
+		n.log.Info("sent group join broadcast message")
+		// if i < 3 {
+		time.Sleep(1 * time.Second)
+		// }
+	}
+
+	<-ctx.Done()
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(responses) == 0 {
+		return false
+	}
+
+	// Select the group with the least members
+	var selectedID uuid.UUID
+	minMembers := int(^uint(0) >> 1) // max int
+
+	for id, info := range responses {
+		if int(info.GroupSize) < minMembers {
+			minMembers = int(info.GroupSize)
+			selectedID = id
+		}
+	}
+
+	// TODO: Actually join the selected group (connect to selectedID)
+	n.log.Info("selected group %s with %d members", selectedID, minMembers)
+
+	return true
+}
+
+func (n *Node) startHttpServer(ip string, port uint16) {
+	httpAddr, err := parseTcp4Addr(fmt.Sprintf("%s:%d", ip, port))
+	if err != nil {
+		n.log.Fatal("invalid HTTP address: %v", err)
+	}
+
+	if err := n.httpServer.Bind(httpAddr.Addr); err != nil {
+		n.log.Fatal("failed to start http server: %v", err)
 	}
 	n.httpServer.RegisterHandler(httpserver.GET, "/kv", n.handleGetKey)
 	n.httpServer.RegisterHandler(httpserver.PUT, "/kv", n.handlePutKey)
 	n.httpServer.RegisterHandler(httpserver.DELETE, "/kv", n.handleDeleteKey)
 
-	go func() {
-		for {
-			if err := n.httpServer.Listen(); err != nil {
-				n.log.Error("[Node] Error in HTTP Listen: %v", err)
-			}
+	for {
+		if err := n.httpServer.Listen(); err != nil {
+			n.log.Error("[Node] Error in HTTP Listen: %v", err)
 		}
-	}()
-
-	// Setup group listener
-	n.clusterListener, err = net.Listen("tcp4", clusterTcpAddr.Str)
-	if err != nil {
-		return nil, err
 	}
-
-	go func() {
-		for {
-			conn, err := n.clusterListener.Accept()
-			if err != nil {
-				n.log.Error("[Node] Error accepting connection: %v", err)
-			}
-			go n.handleGroupMessage(conn)
-		}
-	}()
-
-	// Setup broadcast listener
-	// go func() {
-	// 	if err := broadcast.Listen(broadcastPort, n.log, n.handleBroadcastMessage); err != nil {
-	// 		fmt.Println("Error listening to broadcast: ", err)
-	// 	}
-	// }()
-
-	go n.initiateJoinProcess()
-
-	return n, nil
-}
-
-func (n *Node) initiateJoinProcess() {
-	choices := []int{1, 2, 3, 4, 5}
-	retries := choices[rand.Intn(len(choices))]
-
-	n.log.Info("[Node] Group join: Retry %d times", retries)
-	msg := &BroadcastMessageJoin{
-		Host: n.info.Host,
-		Port: n.info.Port,
-	}
-
-	// Send cluster join message
-	n.sendBroadcastMessage(msg)
-
-	for i := 0; i < retries; i++ {
-		time.Sleep(1 * time.Second) // possible debug
-
-		// check if node already joined a group
-		n.rw.RLock()
-		joined := n.info.GroupID != uuid.Nil
-		n.rw.RUnlock()
-
-		if joined {
-			return
-		}
-
-		time.Sleep(4 * time.Second)
-		n.sendBroadcastMessage(msg)
-	}
-
-	// if no group found start a new group/cluster
-	n.startNewCluster()
-}
-
-func (n *Node) startNewCluster() {
-	n.rw.Lock()
-	defer n.rw.Unlock()
-
-	n.info.GroupID = uuid.New()
-	n.info.IsLeader = true
-	n.isLeader = true
-	n.leaderAddr = formatAddress(n.info.Host, n.info.Port)
-
-	n.log.Info("[Node] Became leader of new group %s", n.info.GroupID.String())
-	n.startListenAndSendHeartbeats()
-}
-
-func (n *Node) handleGroupMessage(conn net.Conn) {
-	defer conn.Close()
-
-	msg, err := Unmarshal(conn)
-	if err != nil {
-		// TODO
-		n.log.Error("[Node] Failed to unmarshal group message: %v", err)
-		return
-	}
-
-	switch m := msg.(type) {
-	case *HeartbeatMessage:
-		n.handleHeartbeat(m)
-
-	case *WriteRequestMessage:
-		n.log.Info("[Node] Received group write key message")
-		k := string(m.Key)
-		v := string(m.Value)
-		n.rw.Lock()
-		n.store[k] = v
-		n.rw.Unlock()
-
-		if n.isLeader {
-			n.log.Info("[Node] Sending key %s with value %s to members", k, v)
-			n.writeNotifyMembers(k, v)
-		}
-
-	case *DeleteRequestMessage:
-		k := string(m.Key)
-		n.log.Info("[Node] Received group delete for key %s", k)
-		n.rw.Lock()
-		delete(n.store, k)
-		n.rw.Unlock()
-
-		if n.isLeader {
-			n.log.Info("[Node] Sending delete for key %s to members", k)
-			n.deleteNotifyMembers(k)
-		}
-
-	case *NodeInfoMessage:
-		n.log.Info("[Node] Received node info message")
-		if n.isLeader {
-			// if m.isLeader {
-			// 	n.groupView.AddOrUpdateNode(m.Info)
-			// 	return
-			// }
-
-			if n.getClusterSize() < GroupSizeThreshold {
-				n.groupView.AddOrUpdateNode(m.Info)
-				n.sendClusterInviteMessage(m.Info)
-			}
-		}
-
-	case *ElectionMessage:
-		n.handleElectionMessage(m)
-
-	case *ClusterJoinMessage:
-		n.handleClusterJoin(m)
-	}
-
 }
 
 func (n *Node) handleGetKey(w *httpserver.ResponseWriter, r *httpserver.Request) {
@@ -245,10 +442,7 @@ func (n *Node) handleGetKey(w *httpserver.ResponseWriter, r *httpserver.Request)
 		return
 	}
 
-	n.rw.RLock()
-	defer n.rw.RUnlock()
-
-	val, ok := n.store[key]
+	val, ok := n.storage.Get(key)
 	if !ok {
 		w.Status(404, "key not found")
 		w.Write([]byte("key not found"))
@@ -266,16 +460,9 @@ func (n *Node) handlePutKey(w *httpserver.ResponseWriter, r *httpserver.Request)
 		return
 	}
 
-	value := r.Body
-
-	if n.isLeader {
-		n.rw.Lock()
-		defer n.rw.Unlock()
-		n.store[key] = value
-		n.writeNotifyMembers(key, value)
-	} else {
-		n.writeNotifyLeader(key, value)
-	}
+	val := r.Body
+	n.storage.Set(key, r.Body)
+	n.writeNotifyMembers(key, val) // TODO: replace with multicast
 
 	w.Status(200, "OK")
 	w.Write([]byte("OK"))
@@ -289,34 +476,18 @@ func (n *Node) handleDeleteKey(w *httpserver.ResponseWriter, r *httpserver.Reque
 		return
 	}
 
-	n.rw.Lock()
-	defer n.rw.Unlock()
-
-	_, ok = n.store[key]
+	_, ok = n.storage.Get(key)
 	if !ok {
 		w.Status(404, "Not Found")
 		w.Write([]byte("key not found"))
 		return
 	}
 
-	if n.isLeader {
-		delete(n.store, key)
-		n.deleteNotifyMembers(key)
-	} else {
-		n.deleteNotifyLeader(key)
-	}
+	n.storage.Delete(key)
+	n.deleteNotifyMembers(key) // TODO: replace with multicast
 
 	w.Status(200, "OK")
 	w.Write([]byte("OK"))
-}
-
-func (n *Node) writeNotifyLeader(key string, value string) error {
-	w := WriteRequestMessage{
-		Key:   []byte(key),
-		Value: []byte(value),
-	}
-	n.notifyPeer(n.leaderAddr, w.Marshal())
-	return nil
 }
 
 func (n *Node) writeNotifyMembers(key string, value string) {
@@ -327,174 +498,18 @@ func (n *Node) writeNotifyMembers(key string, value string) {
 	n.notifyMembers(w.Marshal())
 }
 
-func (n *Node) deleteNotifyLeader(key string) error {
-	d := DeleteRequestMessage{
-		Key: []byte(key),
-	}
-	return n.notifyPeer(n.leaderAddr, d.Marshal())
-}
-
-func (n *Node) deleteNotifyMembers(key string) error {
+func (n *Node) deleteNotifyMembers(key string) {
 	d := DeleteRequestMessage{
 		Key: []byte(key),
 	}
 	n.notifyMembers(d.Marshal())
-	return nil
-}
-
-func (n *Node) notifyPeer(addr string, data []byte) error {
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		n.log.Error("[Node] Connection to peer failed: %v", err)
-		return err
-	}
-	defer conn.Close()
-
-	// TODO: set a timeout, handle partial write
-	_, err = conn.Write(data)
-	if err != nil {
-		n.log.Error("[Node] Write to peer failed: %v", err)
-		return err
-	}
-	return nil
 }
 
 func (n *Node) notifyMembers(data []byte) {
-	for addr := range n.group {
-		if err := n.notifyPeer(addr, data); err != nil {
-			// TODO: handle error appropriately
-		}
-	}
-}
-
-func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
-	header := &BroadcastHeader{}
-	if err := header.Unmarshal(buf); err != nil {
-		n.log.Error("[Node] Failed to unmarshal header: %v", err)
-		return
-	}
-
-	if header.ID == n.info.ID {
-		return
-	}
-
-	payload := buf[header.SizeBytes():]
-
-	switch header.Type {
-	case BroadcastMessageTypeJoin:
-		msg := BroadcastMessageJoin{}
-		if err := msg.Unmarshal(payload); err != nil {
-			n.log.Error("[Node] Failed to unmarshal payload for join message: %v", err)
-			return
-		}
-
-		m := NodeInfoMessage{
-			Info: n.info,
-		}
-		b := m.Marshal()
-
-		addr := formatAddress(msg.Host, msg.Port)
-		n.log.Info("[Node] Notifying peer at %s", addr)
-		n.notifyPeer(addr, b)
-	}
-}
-
-func (n *Node) sendTcpMsg(addr string, buf []byte) {
-	//TODO ?
-}
-
-func (n *Node) sendBroadcastMessage(m BroadcastMessage) error {
-	h := BroadcastHeader{
-		Type: m.Type(),
-		ID:   n.info.ID,
-	}
-
-	buf := make([]byte, h.SizeBytes()+m.SizeBytes())
-
-	if err := h.Marshal(buf[0:h.SizeBytes()]); err != nil {
-		return err
-	}
-
-	if err := m.Marshal(buf[h.SizeBytes():]); err != nil {
-		return err
-	}
-
-	if err := broadcast.Send(n.broadcastPort, buf); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (n *Node) StartHeartbeat() {
-	for {
-		hb := &HeartbeatMessage{Info: n.info}
-		data := hb.Marshal()
-
-		if n.isLeader {
-			if err := broadcast.Send(n.broadcastPort, data); err != nil {
-				n.log.Error("[Heartbeat] broadcast send failed: %v", err)
-			}
-		}
-		if err := broadcast.Send(int(n.groupPort), data); err != nil {
-			n.log.Error("[Heartbeat] group send failed: %v", err)
-		}
-
-		time.Sleep(HeartbeatInterval)
-	}
-}
-
-func (n *Node) handleHeartbeat(m *HeartbeatMessage) {
-	n.groupView.AddOrUpdateNode(m.Info)
-}
-
-func (n *Node) handleClusterJoin(m *ClusterJoinMessage) {
-	n.rw.Lock()
-	defer n.rw.Unlock()
-
-	// node joins group
-	n.leaderAddr = formatAddress(m.Host, m.Port)
-	n.info.GroupID = m.GroupID
-	n.groupPort = m.GroupPort
-	n.log.Info("[Node] Joining Group with ID %s", n.info.GroupID.String())
-	n.startListenAndSendHeartbeats()
-
-}
-
-func (n *Node) startListenAndSendHeartbeats() {
-	go broadcast.Listen(int(n.groupPort), n.log, n.handleBroadcastMessage)
-	go n.StartHeartbeat()
-}
-
-// sendClusterInviteMessage sends a ClusterJoinMessage to invite a node to join this cluster
-func (n *Node) sendClusterInviteMessage(info NodeInfo) {
-	msg := &ClusterJoinMessage{
-		GroupID:   n.info.GroupID,
-		Host:      n.info.Host,
-		Port:      n.info.Port,
-		GroupPort: n.groupPort,
-	}
-
-	addr := formatAddress(info.Host, info.Port)
-	if err := n.notifyPeer(addr, msg.Marshal()); err != nil {
-		n.log.Error("[Node] Failed to send cluster invite to %s: %v", addr, err)
-	} else {
-		n.log.Info("[Node] Sent cluster invite to %s for group %s", addr, n.info.GroupID.String())
-	}
-}
-
-// GetClusterSize returns the number of nodes in the group view with the same GroupID
-func (n *Node) getClusterSize() int {
-	count := 0
-	gv := n.groupView
-	gv.mu.RLock()
-	defer gv.mu.RUnlock()
-
-	for _, node := range n.groupView.nodes {
-		if node.Info.GroupID == n.info.GroupID {
-			count++
-		}
-	}
-
-	return count
+	// TODO: use multicast for this
+	// for addr := range n.group {
+	// 	if err := n.notifyPeer(addr, data); err != nil {
+	// 		// TODO: handle error appropriately
+	// 	}
+	// }
 }

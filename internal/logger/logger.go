@@ -31,6 +31,10 @@ func NewWithWriter(w io.Writer, minLevel Level) *Logger {
 	}
 }
 
+func (l *Logger) Fatal(msg string, args ...any) {
+	l.logger.Fatalf("[FATAL] "+msg, args...)
+}
+
 func (l *Logger) Debug(msg string, args ...any) {
 	if l.minLevel <= DEBUG {
 		l.logger.Printf("[DEBUG] "+msg, args...)

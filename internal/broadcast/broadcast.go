@@ -13,11 +13,11 @@ type BroadcastHandlerFunc func(data []byte, remoteAddr *net.UDPAddr)
 
 const (
 	MaxDatagramSize = 8192
-	IPv4Broadcast  = "255.255.255.255"
+	IPv4Broadcast   = "255.255.255.255"
 )
 
 // Broadcast sends an announcement message to the broadcast address
-func Send(port int, pkt []byte) error {
+func Send(port uint16, pkt []byte) error {
 	broadcastAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", IPv4Broadcast, port))
 	if err != nil {
 		return err
@@ -39,7 +39,7 @@ func Send(port int, pkt []byte) error {
 }
 
 // Listen listens for incoming broadcast announcements
-func Listen(listenPort int, log *logger.Logger, handler BroadcastHandlerFunc) error {
+func Listen(listenPort uint16, log *logger.Logger, handler BroadcastHandlerFunc) error {
 
 	// Create a socket with SO_REUSEADDR and SO_REUSEPORT set before binding
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
@@ -58,7 +58,7 @@ func Listen(listenPort int, log *logger.Logger, handler BroadcastHandlerFunc) er
 	}
 
 	// Bind to the address
-	addr := unix.SockaddrInet4{Port: listenPort}
+	addr := unix.SockaddrInet4{Port: int(listenPort)}
 	if err := unix.Bind(fd, &addr); err != nil {
 		return fmt.Errorf("failed to bind socket: %w", err)
 	}

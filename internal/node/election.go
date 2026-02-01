@@ -30,9 +30,9 @@ func (n *Node) handleElectionMessage(msg *ElectionMessage) {
 
 		n.info.Participant = false
 
-		if !n.isLeader {
+		if !n.info.IsLeader {
 			// Find the leader's address in GroupView
-			leaderNode, err := n.groupView.GetNode(msg.CandidateID)
+			leaderNode, err := n.clusterView.GetNode(msg.CandidateID)
 
 			if err != nil {
 				//TODO
@@ -65,7 +65,7 @@ func (n *Node) handleElectionMessage(msg *ElectionMessage) {
 	} else {
 		// IDs match. The message circled back to me. I won!
 		n.log.Info("[Election] I have won the election!")
-		n.isLeader = true
+		n.info.IsLeader = true
 		n.info.Participant = false
 
 		// Send Leader Announcement
@@ -89,7 +89,7 @@ func CompareUUID(uuid1 uuid.UUID, uuid2 uuid.UUID) int {
 
 func (n *Node) forwardElectionMessage(msg *ElectionMessage) {
 	// determine successor node within group view
-	successorNode, err := n.groupView.GetSuccessor(n.info.ID)
+	successorNode, err := n.clusterView.GetSuccessor(n.info.ID)
 
 	// TODO, what to do if there is no successor found
 	if err != nil {
@@ -98,7 +98,7 @@ func (n *Node) forwardElectionMessage(msg *ElectionMessage) {
 
 	data := msg.Marshal()
 	recipient := formatAddress(successorNode.Host, successorNode.Port)
-	if err := n.notifyPeer(recipient, data); err != nil {
+	if err := n.sendTcpMessage(recipient, data); err != nil {
 		n.log.Error("[Election] Failed to send message to successor %s: %v", recipient, err)
 		// TODO: think if we resend or send to next
 	}

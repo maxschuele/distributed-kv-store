@@ -42,7 +42,7 @@ type ResponseWriter struct {
 type HandlerFunc func(w *ResponseWriter, r *Request)
 
 type Server struct {
-	listener net.Listener
+	listener *net.TCPListener
 	routes   map[Method]map[string]HandlerFunc // method -> path -> handler
 }
 
@@ -52,8 +52,8 @@ func New() *Server {
 	}
 }
 
-func (s *Server) Bind(addr string) error {
-	listener, err := net.Listen("tcp4", addr)
+func (s *Server) Bind(addr *net.TCPAddr) error {
+	listener, err := net.ListenTCP("tcp4", addr)
 	s.listener = listener
 	return err
 }

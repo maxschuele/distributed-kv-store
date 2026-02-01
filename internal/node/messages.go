@@ -10,6 +10,13 @@ import (
 
 type MessageType byte
 
+type Message interface {
+	SizeBytes() int
+	Type() MessageType
+	Unmarshal(buf []byte) error
+	Marshal(buf []byte) error
+}
+
 const (
 	MessageTypeHeartbeat     MessageType = 0x01
 	MessageTypeClusterJoin   MessageType = 0x02
@@ -17,22 +24,41 @@ const (
 	MessageTypeWriteRequest  MessageType = 0x04
 	MessageTypeDeleteRequest MessageType = 0x05
 	MessageTypeElection      MessageType = 0x06
+	MessageTypeGroupJoin     MessageType = 0x07
+	MessageTypeGroupInfo     MessageType = 0x08
 )
 
-type MessageHeader struct {
-	Type BroadcastMessageType
-	ID   uuid.UUID
-}
+const MessageHeaderMagic uint32 = 0x44534B56 // "DSKV" in ASCII
 
-func (h *MessageHeader) SizeBytes() uint { return 17 }
-
-func (h *MessageHeader) Unmarshal(buf []byte) error {
-	if len(buf) < 17 {
-		return NewBufferSizeError(17, len(buf))
+func isNodeMessage(buf []byte) bool {
+	if len(buf) < 4 {
+		return false
 	}
 
-	h.Type = BroadcastMessageType(buf[0])
-	id, err := uuid.FromBytes(buf[1:17])
+	return binary.BigEndian.Uint32(buf[0:4]) == MessageHeaderMagic
+}
+
+type MessageHeader struct {
+	Magic uint32
+	Type  MessageType
+	ID    uuid.UUID
+}
+
+func (h *MessageHeader) SizeBytes() int { return 21 } // 4 (magic) + 1 (type) + 16 (UUID)
+
+func (h *MessageHeader) Unmarshal(buf []byte) error {
+	if len(buf) < h.SizeBytes() {
+		return NewBufferSizeError(h.SizeBytes(), len(buf))
+	}
+
+	h.Magic = binary.BigEndian.Uint32(buf[0:4])
+	if h.Magic != MessageHeaderMagic {
+		return fmt.Errorf("invalid magic number")
+	}
+
+	h.Type = MessageType(buf[4])
+
+	id, err := uuid.FromBytes(buf[5:h.SizeBytes()])
 	if err != nil {
 		return fmt.Errorf("failed to parse UUID: %w", err)
 	}
@@ -42,13 +68,73 @@ func (h *MessageHeader) Unmarshal(buf []byte) error {
 }
 
 func (h *MessageHeader) Marshal(buf []byte) error {
-	if len(buf) < 17 {
-		return NewBufferSizeError(17, len(buf))
+	if len(buf) < h.SizeBytes() {
+		return NewBufferSizeError(h.SizeBytes(), len(buf))
 	}
 
-	buf[0] = byte(h.Type)
-	copy(buf[1:17], h.ID[:])
+	binary.BigEndian.PutUint32(buf[0:4], MessageHeaderMagic)
+	buf[4] = byte(h.Type)
+	copy(buf[5:h.SizeBytes()], h.ID[:])
 
+	return nil
+}
+
+type MessageGroupJoin struct {
+	Host [4]byte
+	Port uint16
+}
+
+func (m *MessageGroupJoin) SizeBytes() int {
+	return 6 // 4 (IP) + 2 (Port)
+}
+
+func (m *MessageGroupJoin) Marshal(buf []byte) error {
+	if len(buf) < m.SizeBytes() {
+		return NewBufferSizeError(m.SizeBytes(), len(buf))
+	}
+	copy(buf[0:4], m.Host[:])
+	binary.BigEndian.PutUint16(buf[4:6], m.Port)
+	return nil
+}
+
+func (m *MessageGroupJoin) Unmarshal(buf []byte) error {
+	if len(buf) < m.SizeBytes() {
+		return NewBufferSizeError(m.SizeBytes(), len(buf))
+	}
+	copy(m.Host[:], buf[0:4])
+	m.Port = binary.BigEndian.Uint16(buf[4:6])
+	return nil
+}
+
+type MessageGroupInfo struct {
+	GroupID    uuid.UUID
+	GroupSize  uint32
+	LeaderHost [4]byte
+	Port       uint16
+}
+
+func (m *MessageGroupInfo) SizeBytes() int    { return 16 + 4 + 4 + 2 }
+func (m *MessageGroupInfo) Type() MessageType { return MessageTypeGroupInfo }
+
+func (m *MessageGroupInfo) Marshal(buf []byte) error {
+	if len(buf) < m.SizeBytes() {
+		return NewBufferSizeError(m.SizeBytes(), len(buf))
+	}
+	copy(buf[0:16], m.GroupID[:])
+	binary.BigEndian.PutUint32(buf[16:20], m.GroupSize)
+	copy(buf[20:24], m.LeaderHost[:])
+	binary.BigEndian.PutUint16(buf[24:26], m.Port)
+	return nil
+}
+
+func (m *MessageGroupInfo) Unmarshal(buf []byte) error {
+	if len(buf) < m.SizeBytes() {
+		return NewBufferSizeError(m.SizeBytes(), len(buf))
+	}
+	copy(m.GroupID[:], buf[0:16])
+	m.GroupSize = binary.BigEndian.Uint32(buf[16:20])
+	copy(m.LeaderHost[:], buf[20:24])
+	m.Port = binary.BigEndian.Uint16(buf[24:26])
 	return nil
 }
 
@@ -71,28 +157,23 @@ func (m *NodeInfoMessage) Marshal() []byte {
 	// [16 bytes: ID UUID]
 	// [16 bytes: GroupID UUID]
 	// [4 bytes: Host]
-	// [4 bytes: Port]
+	// [2 bytes: Port]
 	// [1 byte: IsLeader]
 	// [1 byte: Participant]
 
-	totalSize := 43 // 43 bytes
+	totalSize := 41
 	buf := make([]byte, totalSize)
-
 	offset := 0
 	buf[offset] = byte(MessageTypeNodeInfo)
 	offset += 1
-
 	copy(buf[offset:offset+16], m.Info.ID[:])
 	offset += 16
-
 	copy(buf[offset:offset+16], m.Info.GroupID[:])
 	offset += 16
-
 	copy(buf[offset:offset+4], m.Info.Host[:])
 	offset += 4
-
-	binary.BigEndian.PutUint32(buf[offset:offset+4], m.Info.Port)
-	offset += 4
+	binary.BigEndian.PutUint16(buf[offset:offset+2], m.Info.Port)
+	offset += 2
 
 	if m.Info.IsLeader {
 		buf[offset] = 1
@@ -135,64 +216,58 @@ func (e *ElectionMessage) Marshal() []byte {
 	return buf
 }
 
-type HeartbeatMessage struct {
+type MessageHeartbeat struct {
 	Info NodeInfo
 }
 
-func (h *HeartbeatMessage) Type() MessageType {
-	return MessageTypeHeartbeat
-}
+func (h *MessageHeartbeat) SizeBytes() int    { return 41 }
+func (h *MessageHeartbeat) Type() MessageType { return MessageTypeHeartbeat }
 
-func (h *HeartbeatMessage) Marshal() []byte {
-	// Message format:
-	// [1 byte: message type]
-	// [16 bytes: ID UUID]
-	// [16 bytes: GroupID UUID]
-	// [4 bytes: Host]
-	// [4 bytes: Port]
-	// [1 byte: IsLeader]
-	// [1 byte: Participant]
-
-	totalSize := 43 // 43 bytes
-	buf := make([]byte, totalSize)
+func (h *MessageHeartbeat) Marshal(buf []byte) error {
+	if len(buf) < h.SizeBytes() {
+		return NewBufferSizeError(h.SizeBytes(), len(buf))
+	}
 
 	offset := 0
 	buf[offset] = byte(MessageTypeHeartbeat)
-	offset += 1
+	offset++
+	offset += copy(buf[offset:offset+16], h.Info.ID[:])
+	offset += copy(buf[offset:offset+16], h.Info.GroupID[:])
+	offset += copy(buf[offset:offset+4], h.Info.Host[:])
+	binary.BigEndian.PutUint16(buf[offset:offset+2], h.Info.Port)
+	offset += 2
+	buf[offset] = boolToByte(h.Info.IsLeader)
+	offset++
+	buf[offset] = boolToByte(h.Info.Participant)
 
-	copy(buf[offset:offset+16], h.Info.ID[:])
-	offset += 16
+	return nil
+}
 
-	copy(buf[offset:offset+16], h.Info.GroupID[:])
-	offset += 16
-
-	copy(buf[offset:offset+4], h.Info.Host[:])
-	offset += 4
-
-	binary.BigEndian.PutUint32(buf[offset:offset+4], h.Info.Port)
-	offset += 4
-
-	if h.Info.IsLeader {
-		buf[offset] = 1
-	} else {
-		buf[offset] = 0
+func (h *MessageHeartbeat) Unmarshal(buf []byte) error {
+	if len(buf) < h.SizeBytes() {
+		return NewBufferSizeError(h.SizeBytes(), len(buf))
 	}
-	offset += 1
-
-	if h.Info.Participant {
-		buf[offset] = 1
-	} else {
-		buf[offset] = 0
-	}
-
-	return buf
+	offset := 0
+	offset++
+	copy(h.Info.ID[:], buf[offset:offset+16])
+	offset += 16
+	copy(h.Info.GroupID[:], buf[offset:offset+16])
+	offset += 16
+	copy(h.Info.Host[:], buf[offset:offset+4])
+	offset += 4
+	h.Info.Port = binary.BigEndian.Uint16(buf[offset : offset+2])
+	offset += 2
+	h.Info.IsLeader = byteToBool(buf[offset])
+	offset++
+	h.Info.Participant = byteToBool(buf[offset])
+	return nil
 }
 
 type ClusterJoinMessage struct {
 	GroupID   uuid.UUID
 	Host      [4]byte
-	Port      uint32
-	GroupPort uint32
+	Port      uint16
+	GroupPort uint16
 }
 
 func (h *ClusterJoinMessage) Type() MessageType {
@@ -204,26 +279,22 @@ func (h *ClusterJoinMessage) Marshal() []byte {
 	// [1 byte: message type]
 	// [16 bytes: GroupID]
 	// [4 bytes: Host]
-	// [4 bytes: Port]
-	// [4 bytes: GroupPort]
+	// [2 bytes: Port]
+	// [2 bytes: GroupPort]
 
-	totalSize := 29 // 29 bytes
+	totalSize := 25 // 25 bytes (was 29)
 	buf := make([]byte, totalSize)
-
 	offset := 0
 	buf[offset] = byte(MessageTypeClusterJoin)
 	offset += 1
-
 	copy(buf[offset:offset+16], h.GroupID[:])
 	offset += 16
-
 	copy(buf[offset:offset+4], h.Host[:])
 	offset += 4
+	binary.BigEndian.PutUint16(buf[offset:offset+2], h.Port)
+	offset += 2
+	binary.BigEndian.PutUint16(buf[offset:offset+2], h.GroupPort)
 
-	binary.BigEndian.PutUint32(buf[offset:offset+4], h.Port)
-	offset += 4
-
-	binary.BigEndian.PutUint32(buf[offset:offset+4], h.GroupPort)
 	return buf
 }
 
@@ -293,36 +364,27 @@ func Unmarshal(r io.Reader) (TcpMessage, error) {
 	if _, err := io.ReadFull(r, typeBuf); err != nil {
 		return nil, fmt.Errorf("failed to read message type: %w", err)
 	}
-
 	msgType := MessageType(typeBuf[0])
-
 	switch msgType {
-	case MessageTypeHeartbeat:
-		return &HeartbeatMessage{}, nil
-
 	case MessageTypeWriteRequest:
 		keyLenBuf := make([]byte, 4)
 		if _, err := io.ReadFull(r, keyLenBuf); err != nil {
 			return nil, fmt.Errorf("failed to read key length: %w", err)
 		}
 		keyLen := binary.BigEndian.Uint32(keyLenBuf)
-
 		key := make([]byte, keyLen)
 		if _, err := io.ReadFull(r, key); err != nil {
 			return nil, fmt.Errorf("failed to read key data: %w", err)
 		}
-
 		valueLenBuf := make([]byte, 4)
 		if _, err := io.ReadFull(r, valueLenBuf); err != nil {
 			return nil, fmt.Errorf("failed to read value length: %w", err)
 		}
 		valueLen := binary.BigEndian.Uint32(valueLenBuf)
-
 		value := make([]byte, valueLen)
 		if _, err := io.ReadFull(r, value); err != nil {
 			return nil, fmt.Errorf("failed to read value data: %w", err)
 		}
-
 		return &WriteRequestMessage{
 			Key:   key,
 			Value: value,
@@ -333,42 +395,31 @@ func Unmarshal(r io.Reader) (TcpMessage, error) {
 			return nil, fmt.Errorf("failed to read key length: %w", err)
 		}
 		keyLen := binary.BigEndian.Uint32(keyLenBuf)
-
 		key := make([]byte, keyLen)
 		if _, err := io.ReadFull(r, key); err != nil {
 			return nil, fmt.Errorf("Failed to read value length: %w", err)
 		}
-
 		return &DeleteRequestMessage{
 			Key: key,
 		}, nil
-
 	case MessageTypeNodeInfo:
-		buf := make([]byte, 42) // 16+16+4+4+1+1
+		buf := make([]byte, 40) // 16+16+4+2+1+1 (was 42)
 		if _, err := io.ReadFull(r, buf); err != nil {
 			return nil, fmt.Errorf("failed to read node info data: %w", err)
 		}
-
 		msg := &NodeInfoMessage{}
 		offset := 0
-
 		copy(msg.Info.ID[:], buf[offset:offset+16])
 		offset += 16
-
 		copy(msg.Info.GroupID[:], buf[offset:offset+16])
 		offset += 16
-
 		copy(msg.Info.Host[:], buf[offset:offset+4])
 		offset += 4
-
-		msg.Info.Port = binary.BigEndian.Uint32(buf[offset : offset+4])
-		offset += 4
-
+		msg.Info.Port = binary.BigEndian.Uint16(buf[offset : offset+2])
+		offset += 2
 		msg.Info.IsLeader = buf[offset] != 0
 		offset += 1
-
 		msg.Info.Participant = buf[offset] != 0
-
 		return msg, nil
 	case MessageTypeElection:
 		buf := make([]byte, 17) // 16 + 1
@@ -384,27 +435,45 @@ func Unmarshal(r io.Reader) (TcpMessage, error) {
 			IsLeader:    buf[16] == 1,
 		}, nil
 	case MessageTypeClusterJoin:
-		buf := make([]byte, 28)
+		buf := make([]byte, 24) // 16+4+2+2 (was 28)
 		if _, err := io.ReadFull(r, buf); err != nil {
 			return nil, fmt.Errorf("failed to read node info data: %w", err)
 		}
-
 		msg := &ClusterJoinMessage{}
 		offset := 0
-
 		copy(msg.GroupID[:], buf[offset:offset+16])
 		offset += 16
-
 		copy(msg.Host[:], buf[offset:offset+4])
 		offset += 4
-
-		msg.Port = binary.BigEndian.Uint32(buf[offset : offset+4])
-		offset += 4
-
-		msg.GroupPort = binary.BigEndian.Uint32(buf[offset : offset+4])
-
+		msg.Port = binary.BigEndian.Uint16(buf[offset : offset+2])
+		offset += 2
+		msg.GroupPort = binary.BigEndian.Uint16(buf[offset : offset+2])
 		return msg, nil
 	default:
 		return nil, fmt.Errorf("unknown message type: 0x%02x", msgType)
 	}
+}
+
+func boolToByte(b bool) byte {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func byteToBool(b byte) bool {
+	return b != 0
+}
+
+type BufferSizeError struct {
+	Expected int
+	Got      int
+}
+
+func (e *BufferSizeError) Error() string {
+	return fmt.Sprintf("buffer too small: expected at least %d bytes, got %d", e.Expected, e.Got)
+}
+
+func NewBufferSizeError(expected, got int) *BufferSizeError {
+	return &BufferSizeError{Expected: expected, Got: got}
 }

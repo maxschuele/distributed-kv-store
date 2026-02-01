@@ -41,15 +41,16 @@ func (gv *GroupView) AddOrUpdateNode(i NodeInfo) {
 
 	if record, exists := gv.nodes[i.ID]; exists {
 		record.LastSeen = time.Now()
-		record.Info = i
-		gv.log.Info("[GroupView] Updated node: %s (last seen: now)\n", i.ID)
+		// TODO: does the node info ever change?
+		// record.Info = i
+		// gv.log.Info("[GroupView] Updated node: %s (last seen: now)\n", i.ID)
 	} else {
 		gv.nodes[i.ID] = &NodeRecord{
 			Info:         i,
 			LastSeen:     time.Now(),
 			DiscoveredAt: time.Now(),
 		}
-		gv.log.Info("[GroupView] Discovered new node: %s\n", i.ID)
+		gv.log.Info("[GroupView] Discovered new node: %s\n", i.ID.String())
 	}
 }
 
@@ -106,14 +107,12 @@ func (gv *GroupView) Size() int {
 
 // StartHeartbeatMonitor starts a goroutine that periodically removes stale nodes
 func (gv *GroupView) StartHeartbeatMonitor(timeout time.Duration, checkInterval time.Duration) {
-	go func() {
-		ticker := time.NewTicker(checkInterval)
-		defer ticker.Stop()
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
 
-		for range ticker.C {
-			gv.RemoveStaleNodes(timeout)
-		}
-	}()
+	for range ticker.C {
+		gv.RemoveStaleNodes(timeout)
+	}
 }
 
 /*

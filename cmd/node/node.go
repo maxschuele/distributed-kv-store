@@ -1,56 +1,52 @@
 package main
 
 import (
+	"distributed-kv-store/internal/node"
 	"flag"
 	"fmt"
 	"os"
-	"strconv"
-	"strings"
-
-	distkv "distributed-kv-store/internal/node"
 )
 
 func main() {
+	replication := flag.Bool("replication", false, "Run node as replication node")
 	ip := flag.String("ip", "", "IP address to use")
-	httpPort := flag.String("http-port", "", "HTTP server address")
-	clusterPort := flag.String("cluster-port", "", "Cluster communication address")
-	isLeader := flag.Bool("leader", false, "Whether this node is the leader")
-	groupMembers := flag.String("members", "", "Comma-separated list of group member addresses (e.g., localhost:8081,localhost:8082)")
-	leaderAddr := flag.String("leader-addr", "", "Address of the leader node (required if not leader)")
-	broadcastPortRaw := flag.String("broadcast-port", "", "Broadcast port to listen/send on")
-
+	httpPortRaw := flag.Uint("http-port", 0, "HTTP server address")
+	clusterPortRaw := flag.Uint("cluster-port", 0, "Cluster communication address")
+	groupPortRaw := flag.Uint("group-port", 0, "Group port")
+	broadcastPortRaw := flag.Uint("broadcast-port", 9998, "Broadcast port")
 	flag.Parse()
 
-	broadcastPort, err := strconv.Atoi(*broadcastPortRaw)
-
-	// initialize with not used value
-	var groupPort uint32
-
-	if err != nil {
-		fmt.Println("Error: -broadcast-port must be a valid integer number: ", err)
-		flag.Usage()
-		os.Exit(1)
+	if *ip == "" {
+		exit("Error: -ip flag is required\n")
 	}
 
-	if !*isLeader && *leaderAddr == "" {
-		fmt.Println("Error: -leader-addr is required when -leader is false")
-		flag.Usage()
-		os.Exit(1)
-	}
+	clusterPort := validatePort(*clusterPortRaw, "cluster-port")
+	broadcastPort := validatePort(*broadcastPortRaw, "broadcast-port")
 
-	var group []string
-	if *groupMembers != "" {
-		group = strings.Split(*groupMembers, ",")
-		for i := range group {
-			group[i] = strings.TrimSpace(group[i])
-		}
-	}
-
-	_, err = distkv.NewNode(*ip, *httpPort, *clusterPort, *isLeader, group, *leaderAddr, broadcastPort, groupPort)
-	if err != nil {
-		fmt.Printf("Failed to initialize node: %v\n", err)
-		os.Exit(1)
+	if *replication {
+		node.StartReplicationNode(*ip, clusterPort, broadcastPort)
+	} else {
+		httpPort := validatePort(*httpPortRaw, "http-port")
+		groupPort := validatePort(*groupPortRaw, "group-port")
+		node.StartNode(*ip, httpPort, clusterPort, groupPort, broadcastPort)
 	}
 
 	select {}
+}
+
+func exit(msg string, a ...any) {
+	fmt.Fprintf(os.Stderr, msg, a...)
+	os.Exit(1)
+}
+
+func validatePort(port uint, name string) uint16 {
+	if port == 0 {
+		exit("Error -%s is required\n", name)
+	}
+
+	if port > 65535 {
+		exit("Error: invalid -%s value: %d exceeds uint16 max (65535)", name, port)
+	}
+
+	return uint16(port)
 }
