@@ -1,4 +1,4 @@
-package casting
+package multicast
 
 import (
 	"bytes"
