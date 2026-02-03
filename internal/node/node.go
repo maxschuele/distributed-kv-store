@@ -61,14 +61,15 @@ func StartNode(ip string, httpPort uint16, clusterPort uint16, groupPort uint16,
 	log.Info("starting node %s", info.ID.String())
 
 	n := &Node{
-		info:          info,
-		log:           log,
-		httpServer:    httpserver.New(),
-		clusterView:   NewGroupView(log),
-		storage:       NewStorage(),
-		rw:            sync.RWMutex{},
-		broadcastPort: broadcastPort,
-		groupPort:     groupPort,
+		info:            info,
+		log:             log,
+		httpServer:      httpserver.New(),
+		clusterView:     NewGroupView(log),
+		replicationView: NewGroupView(log),
+		storage:         NewStorage(),
+		rw:              sync.RWMutex{},
+		broadcastPort:   broadcastPort,
+		groupPort:       groupPort,
 	}
 
 	n.clusterListener, err = net.ListenTCP("tcp4", clusterTcpAddr.Addr)
@@ -84,11 +85,19 @@ func StartNode(ip string, httpPort uint16, clusterPort uint16, groupPort uint16,
 		}
 	}()
 
-	go n.sendClusterHeartbeats()
+	go func() {
+		if err := broadcast.Listen(groupPort, n.log, n.handleReplicationBroadcastMessage); err != nil {
+			n.log.Fatal("Error listening to broadcast: %v", err)
+		}
+	}()
+
+	go n.sendHeartbeats(n.broadcastPort)
+	go n.sendHeartbeats(n.groupPort)
 
 	// TODO: add this back in
 	// Start heartbeat monitor
 	go n.clusterView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval)
+	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval)
 	// go n.startHttpServer(ip, httpPort)
 }
 
@@ -109,11 +118,12 @@ func StartReplicationNode(ip string, clusterPort uint16, broadcastPort uint16) {
 	}
 
 	n := &Node{
-		info:          info,
-		log:           log,
-		storage:       NewStorage(),
-		rw:            sync.RWMutex{},
-		broadcastPort: broadcastPort,
+		info:            info,
+		log:             log,
+		storage:         NewStorage(),
+		rw:              sync.RWMutex{},
+		broadcastPort:   broadcastPort,
+		replicationView: NewGroupView(log),
 	}
 
 	n.clusterListener, err = net.ListenTCP("tcp4", clusterTcpAddr.Addr)
@@ -126,7 +136,17 @@ func StartReplicationNode(ip string, clusterPort uint16, broadcastPort uint16) {
 		joined = n.groupJoin()
 	}
 
+	go func() {
+		if err := broadcast.Listen(n.groupPort, n.log, n.handleReplicationBroadcastMessage); err != nil {
+			n.log.Fatal("Error listening to broadcast: %v", err)
+		}
+	}()
+
+	go n.sendHeartbeats(n.groupPort)
+	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval)
+
 	go n.listenClusterMessages()
+
 }
 
 func (n *Node) listenClusterMessages() {
@@ -144,7 +164,7 @@ func (n *Node) handleClusterMessage(conn net.Conn) {
 
 }
 
-func (n *Node) sendClusterHeartbeats() {
+func (n *Node) sendHeartbeats(port uint16) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -155,18 +175,17 @@ func (n *Node) sendClusterHeartbeats() {
 	msg := MessageHeartbeat{
 		Info: n.info,
 	}
-	buf := make([]byte, header.SizeBytes()+msg.SizeBytes())
 
+	buf := make([]byte, header.SizeBytes()+msg.SizeBytes())
 	if err := header.Marshal(buf); err != nil {
 		n.log.Fatal("failed to marshal heartbeat header: %v", err)
 	}
-
 	if err := msg.Marshal(buf[header.SizeBytes():]); err != nil {
 		n.log.Fatal("failed to marshal heartbeat message: %v", err)
 	}
 
 	for {
-		if err := broadcast.Send(n.broadcastPort, buf); err != nil {
+		if err := broadcast.Send(port, buf); err != nil {
 			n.log.Error("failed to broadcast heartbeat message: %v", err)
 		}
 		<-ticker.C
@@ -228,31 +247,43 @@ func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 			return
 		}
 
-		// outHeader := &MessageHeader{
-		// 	ID:   n.info.ID,
-		// 	Type: MessageTypeGroupJoin,
-		// }
-		// outMsg := MessageGroupInfo{
-		// 	GroupID:    n.info.GroupID,
-		// 	GroupSize:  1,
-		// 	LeaderHost: n.info.Host,
-		// 	Port:       n.info.Port,
-		// }
-		// outBuf := make([]byte, outHeader.SizeBytes()+outMsg.SizeBytes())
-		// if err := outHeader.Marshal(outBuf); err != nil {
-		// 	n.log.Error("Failed to marshal message header: %v", err)
-		// 	return
-		// }
-		// if err := outMsg.Marshal(outBuf[outHeader.SizeBytes():]); err != nil {
-		// 	n.log.Error("Failed to marshal group info message: %v", err)
-		// }
-
 		n.sendMsg(formatAddress(msg.Host, msg.Port), &MessageGroupInfo{
 			GroupID:    n.info.GroupID,
-			GroupSize:  1,
+			GroupSize:  uint32(n.replicationView.Size()), // TODO: fix cast
 			LeaderHost: n.info.Host,
-			Port:       n.info.Port,
+			LeaderPort: n.info.Port,
+			GroupPort:  n.groupPort,
 		})
+	}
+}
+
+func (n *Node) handleReplicationBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
+	if !isNodeMessage(buf) {
+		n.log.Debug("got non node message")
+		return
+	}
+
+	header := &MessageHeader{}
+	if err := header.Unmarshal(buf); err != nil {
+		n.log.Error("[Node] Failed to unmarshal header: %v", err)
+		return
+	}
+
+	if header.ID == n.info.ID {
+		return
+	}
+
+	payload := buf[header.SizeBytes():]
+
+	switch header.Type {
+	case MessageTypeHeartbeat:
+		msg := MessageHeartbeat{}
+		if err := msg.Unmarshal(payload); err != nil {
+			n.log.Error("Failed to unmarshal cluster heartbeat: %v", err)
+			return
+		}
+
+		n.replicationView.AddOrUpdateNode(msg.Info)
 	}
 }
 
@@ -408,8 +439,20 @@ func (n *Node) groupJoin() bool {
 		}
 	}
 
-	// TODO: Actually join the selected group (connect to selectedID)
 	n.log.Info("selected group %s with %d members", selectedID, minMembers)
+
+	selected := responses[selectedID]
+
+	n.groupPort = selected.GroupPort
+	n.info.GroupID = selected.GroupID
+
+	n.replicationView.AddOrUpdateNode(NodeInfo{
+		ID:       selectedID,
+		GroupID:  selected.GroupID,
+		Host:     selected.LeaderHost,
+		Port:     selected.LeaderPort,
+		IsLeader: true,
+	})
 
 	return true
 }

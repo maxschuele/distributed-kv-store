@@ -106,14 +106,16 @@ func (m *MessageGroupJoin) Unmarshal(buf []byte) error {
 	return nil
 }
 
+// TODO: use NodeInfo instead, add GroupPort to NodeInfo
 type MessageGroupInfo struct {
 	GroupID    uuid.UUID
 	GroupSize  uint32
 	LeaderHost [4]byte
-	Port       uint16
+	LeaderPort uint16
+	GroupPort  uint16
 }
 
-func (m *MessageGroupInfo) SizeBytes() int    { return 16 + 4 + 4 + 2 }
+func (m *MessageGroupInfo) SizeBytes() int    { return 16 + 4 + 4 + 2 + 2 }
 func (m *MessageGroupInfo) Type() MessageType { return MessageTypeGroupInfo }
 
 func (m *MessageGroupInfo) Marshal(buf []byte) error {
@@ -123,7 +125,8 @@ func (m *MessageGroupInfo) Marshal(buf []byte) error {
 	copy(buf[0:16], m.GroupID[:])
 	binary.BigEndian.PutUint32(buf[16:20], m.GroupSize)
 	copy(buf[20:24], m.LeaderHost[:])
-	binary.BigEndian.PutUint16(buf[24:26], m.Port)
+	binary.BigEndian.PutUint16(buf[24:26], m.LeaderPort)
+	binary.BigEndian.PutUint16(buf[26:28], m.GroupPort)
 	return nil
 }
 
@@ -134,7 +137,8 @@ func (m *MessageGroupInfo) Unmarshal(buf []byte) error {
 	copy(m.GroupID[:], buf[0:16])
 	m.GroupSize = binary.BigEndian.Uint32(buf[16:20])
 	copy(m.LeaderHost[:], buf[20:24])
-	m.Port = binary.BigEndian.Uint16(buf[24:26])
+	m.LeaderPort = binary.BigEndian.Uint16(buf[24:26])
+	m.GroupPort = binary.BigEndian.Uint16(buf[26:28])
 	return nil
 }
 
