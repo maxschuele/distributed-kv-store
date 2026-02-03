@@ -1,13 +1,25 @@
-package client
+package main
 
-import "flag"
+import (
+	"bufio"
+	"distributed-kv-store/internal/node"
+	"flag"
+	"fmt"
+	"os"
+)
 
 func main() {
 	broadcastPortRaw := flag.Uint("broadcast-port", 9998, "Broadcast port")
 
 	broadcastPort := validatePort(*broadcastPortRaw, "broadcast-port")
-	node.StartNewClient(broadcastPort)
+	client := node.StartNewClient(broadcastPort)
 
+	scanner := bufio.NewScanner(os.Stdin)
+	fmt.Println("Echo (Ctrl+C to exit):")
+
+	for scanner.Scan() {
+		client.ProcessInput(scanner.Text())
+	}
 }
 
 func exit(msg string, a ...any) {

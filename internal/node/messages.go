@@ -30,7 +30,7 @@ const (
 
 const MessageHeaderMagic uint32 = 0x44534B56 // "DSKV" in ASCII
 
-func isNodeMessage(buf []byte) bool {
+func isClusterMessage(buf []byte) bool {
 	if len(buf) < 4 {
 		return false
 	}
@@ -162,10 +162,11 @@ func (m *NodeInfoMessage) Marshal() []byte {
 	// [16 bytes: GroupID UUID]
 	// [4 bytes: Host]
 	// [2 bytes: Port]
+	// [2 bytes: HttpPort]
 	// [1 byte: IsLeader]
 	// [1 byte: Participant]
 
-	totalSize := 41
+	totalSize := 43
 	buf := make([]byte, totalSize)
 	offset := 0
 	buf[offset] = byte(MessageTypeNodeInfo)
@@ -177,6 +178,8 @@ func (m *NodeInfoMessage) Marshal() []byte {
 	copy(buf[offset:offset+4], m.Info.Host[:])
 	offset += 4
 	binary.BigEndian.PutUint16(buf[offset:offset+2], m.Info.Port)
+	offset += 2
+	binary.BigEndian.PutUint16(buf[offset:offset+2], m.Info.HttpPort)
 	offset += 2
 
 	if m.Info.IsLeader {
@@ -224,7 +227,7 @@ type MessageHeartbeat struct {
 	Info NodeInfo
 }
 
-func (h *MessageHeartbeat) SizeBytes() int    { return 41 }
+func (h *MessageHeartbeat) SizeBytes() int    { return 43 }
 func (h *MessageHeartbeat) Type() MessageType { return MessageTypeHeartbeat }
 
 func (h *MessageHeartbeat) Marshal(buf []byte) error {
@@ -240,6 +243,8 @@ func (h *MessageHeartbeat) Marshal(buf []byte) error {
 	offset += copy(buf[offset:offset+4], h.Info.Host[:])
 	binary.BigEndian.PutUint16(buf[offset:offset+2], h.Info.Port)
 	offset += 2
+	binary.BigEndian.PutUint16(buf[offset:offset+2], h.Info.HttpPort)
+	offset += 2
 	buf[offset] = boolToByte(h.Info.IsLeader)
 	offset++
 	buf[offset] = boolToByte(h.Info.Participant)
@@ -252,7 +257,7 @@ func (h *MessageHeartbeat) Unmarshal(buf []byte) error {
 		return NewBufferSizeError(h.SizeBytes(), len(buf))
 	}
 	offset := 0
-	offset++
+	offset++ // skip message type byte
 	copy(h.Info.ID[:], buf[offset:offset+16])
 	offset += 16
 	copy(h.Info.GroupID[:], buf[offset:offset+16])
@@ -260,6 +265,8 @@ func (h *MessageHeartbeat) Unmarshal(buf []byte) error {
 	copy(h.Info.Host[:], buf[offset:offset+4])
 	offset += 4
 	h.Info.Port = binary.BigEndian.Uint16(buf[offset : offset+2])
+	offset += 2
+	h.Info.HttpPort = binary.BigEndian.Uint16(buf[offset : offset+2])
 	offset += 2
 	h.Info.IsLeader = byteToBool(buf[offset])
 	offset++
@@ -407,7 +414,7 @@ func Unmarshal(r io.Reader) (TcpMessage, error) {
 			Key: key,
 		}, nil
 	case MessageTypeNodeInfo:
-		buf := make([]byte, 40) // 16+16+4+2+1+1 (was 42)
+		buf := make([]byte, 42) // 16+16+4+2+2+1+1
 		if _, err := io.ReadFull(r, buf); err != nil {
 			return nil, fmt.Errorf("failed to read node info data: %w", err)
 		}
@@ -420,6 +427,8 @@ func Unmarshal(r io.Reader) (TcpMessage, error) {
 		copy(msg.Info.Host[:], buf[offset:offset+4])
 		offset += 4
 		msg.Info.Port = binary.BigEndian.Uint16(buf[offset : offset+2])
+		offset += 2
+		msg.Info.HttpPort = binary.BigEndian.Uint16(buf[offset : offset+2])
 		offset += 2
 		msg.Info.IsLeader = buf[offset] != 0
 		offset += 1

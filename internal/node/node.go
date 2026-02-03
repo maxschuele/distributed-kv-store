@@ -24,6 +24,7 @@ type NodeInfo struct {
 	GroupID     uuid.UUID
 	Host        [4]byte
 	Port        uint16
+	HttpPort    uint16
 	IsLeader    bool
 	Participant bool
 }
@@ -55,6 +56,7 @@ func StartNode(ip string, httpPort uint16, clusterPort uint16, groupPort uint16,
 		GroupID:  uuid.Nil,
 		Host:     clusterTcpAddr.Host,
 		Port:     clusterTcpAddr.Port,
+		HttpPort: httpPort,
 		IsLeader: true,
 	}
 
@@ -98,7 +100,7 @@ func StartNode(ip string, httpPort uint16, clusterPort uint16, groupPort uint16,
 	// Start heartbeat monitor
 	go n.clusterView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval)
 	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval)
-	// go n.startHttpServer(ip, httpPort)
+	go n.startHttpServer(ip, httpPort)
 }
 
 func StartReplicationNode(ip string, clusterPort uint16, broadcastPort uint16) {
@@ -156,12 +158,11 @@ func (n *Node) listenClusterMessages() {
 			n.log.Error("Error accepting cluster tcp connection: %v", err)
 		}
 		go n.handleClusterMessage(conn)
-		conn.Close()
 	}
 }
 
 func (n *Node) handleClusterMessage(conn net.Conn) {
-
+	defer conn.Close()
 }
 
 func (n *Node) sendHeartbeats(port uint16) {
@@ -210,7 +211,7 @@ func (n *Node) sendTcpMessage(addr string, data []byte) error {
 }
 
 func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
-	if !isNodeMessage(buf) {
+	if !isClusterMessage(buf) {
 		n.log.Debug("got non node message")
 		return
 	}
@@ -258,7 +259,7 @@ func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 }
 
 func (n *Node) handleReplicationBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
-	if !isNodeMessage(buf) {
+	if !isClusterMessage(buf) {
 		n.log.Debug("got non node message")
 		return
 	}
@@ -352,7 +353,7 @@ func (n *Node) groupJoin() bool {
 					n.log.Error("failed to read magic: %v", err)
 					return
 				}
-				if !isNodeMessage(buf) {
+				if !isClusterMessage(buf) {
 					n.log.Info("not node message")
 					return
 				}
