@@ -163,7 +163,7 @@ func (rom *ReliableFIFOMulticast) Stop() {
 }
 
 // InitializeMulticastListener binds to the multicast port, joins the group,
-// and starts receiving FIFO messages (type tag 0x01).
+// and starts receiving FIFO messages (type tag 0xA1).
 func (rom *ReliableFIFOMulticast) InitializeMulticastListener(groupIP string, port int) error {
 	ip := net.ParseIP(groupIP)
 	if ip == nil || ip.To4() == nil {
@@ -258,7 +258,7 @@ func (rom *ReliableFIFOMulticast) InitializeMulticastListener(groupIP string, po
 				continue
 			}
 
-			if buf[0] != 0x01 {
+			if buf[0] != 0xA1 {
 				continue
 			}
 			msg, err := UnmarshalFIFOMessage(buf[:n])
@@ -315,7 +315,7 @@ func (rom *ReliableFIFOMulticast) InitializeUnicastListener(listenPort int) erro
 			}
 
 			switch buf[0] {
-			case 0x01:
+			case 0xA1:
 				// retransmitted FIFO message
 				msg, err := UnmarshalFIFOMessage(buf[:n])
 				if err != nil {
@@ -323,7 +323,7 @@ func (rom *ReliableFIFOMulticast) InitializeUnicastListener(listenPort int) erro
 				}
 				_ = rom.ReceiveMulticast(msg)
 
-			case 0x02:
+			case 0xA2:
 				// NAK
 				nak, err := UnmarshalNAKMessage(buf[:n])
 				if err != nil {
@@ -336,7 +336,7 @@ func (rom *ReliableFIFOMulticast) InitializeUnicastListener(listenPort int) erro
 
 				_ = rom.RetransmitMissingMessage(nak.RequesterID, nak.MissingSeq)
 
-			case 0x03:
+			case 0xA3:
 				// LASTACK
 				la, err := UnmarshalLastAckMessage(buf[:n])
 				if err != nil {
@@ -637,10 +637,10 @@ func isLocalMulticast(ip net.IP) bool {
 	return ip4 != nil && ip4[0] == 224 && ip4[1] == 0 && ip4[2] == 0
 }
 
-// MarshalFIFOMessage serializes a FIFOMessage. First byte is a type tag (0x01).
+// MarshalFIFOMessage serializes a FIFOMessage. First byte is a type tag (0xA1).
 func MarshalFIFOMessage(msg *FIFOMessage) ([]byte, error) {
 	buf := &bytes.Buffer{}
-	_ = buf.WriteByte(0x01)
+	_ = buf.WriteByte(0xA1)
 	if _, err := buf.Write(msg.SenderID[:]); err != nil {
 		return nil, err
 	}
@@ -666,7 +666,7 @@ func UnmarshalFIFOMessage(data []byte) (*FIFOMessage, error) {
 	if err := binary.Read(buf, binary.BigEndian, &tag); err != nil {
 		return nil, err
 	}
-	if tag != 0x01 {
+	if tag != 0xA1 {
 		return nil, fmt.Errorf("unexpected message type: %d", tag)
 	}
 	var idBytes [16]byte
@@ -698,10 +698,10 @@ func UnmarshalFIFOMessage(data []byte) (*FIFOMessage, error) {
 	}, nil
 }
 
-// MarshalNAKMessage serializes a NAKMessage. First byte is a type tag (0x02).
+// MarshalNAKMessage serializes a NAKMessage. First byte is a type tag (0xA2).
 func MarshalNAKMessage(msg *NAKMessage) ([]byte, error) {
 	buf := &bytes.Buffer{}
-	_ = buf.WriteByte(0x02)
+	_ = buf.WriteByte(0xA2)
 	if _, err := buf.Write(msg.RequesterID[:]); err != nil {
 		return nil, err
 	}
@@ -721,7 +721,7 @@ func UnmarshalNAKMessage(data []byte) (*NAKMessage, error) {
 	if err := binary.Read(buf, binary.BigEndian, &tag); err != nil {
 		return nil, err
 	}
-	if tag != 0x02 {
+	if tag != 0xA2 {
 		return nil, fmt.Errorf("unexpected message type: %d", tag)
 	}
 	var reqBytes [16]byte
@@ -744,10 +744,10 @@ func UnmarshalNAKMessage(data []byte) (*NAKMessage, error) {
 	}, nil
 }
 
-// MarshalLastAckMessage serializes a LastAckMessage. First byte is a type tag (0x03).
+// MarshalLastAckMessage serializes a LastAckMessage. First byte is a type tag (0xA3).
 func MarshalLastAckMessage(msg *LastAckMessage) ([]byte, error) {
 	buf := &bytes.Buffer{}
-	_ = buf.WriteByte(0x03)
+	_ = buf.WriteByte(0xA3)
 	if _, err := buf.Write(msg.RequesterID[:]); err != nil {
 		return nil, err
 	}
@@ -767,7 +767,7 @@ func UnmarshalLastAckMessage(data []byte) (*LastAckMessage, error) {
 	if err := binary.Read(buf, binary.BigEndian, &tag); err != nil {
 		return nil, err
 	}
-	if tag != 0x03 {
+	if tag != 0xA3 {
 		return nil, fmt.Errorf("unexpected message type: %d", tag)
 	}
 	var reqBytes [16]byte
