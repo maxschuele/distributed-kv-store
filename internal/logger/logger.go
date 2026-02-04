@@ -1,9 +1,11 @@
 package logger
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 )
 
 type Level int
@@ -29,6 +31,21 @@ func NewWithWriter(w io.Writer, minLevel Level) *Logger {
 		logger:   log.New(w, "", log.LstdFlags),
 		minLevel: minLevel,
 	}
+}
+
+func NewFileLogger(filePath string, minLevel Level) (*Logger, error) {
+	dirPath := filepath.Dir(filePath)
+	err := os.Mkdir(dirPath, 0755)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to create logger: %w", err)
+	}
+
+	logFile, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to create logger: %w", err)
+	}
+
+	return NewWithWriter(logFile, minLevel), nil
 }
 
 func (l *Logger) Fatal(msg string, args ...any) {

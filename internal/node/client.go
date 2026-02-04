@@ -16,8 +16,13 @@ type Client struct {
 	httpClient    *httpclient.Client
 }
 
-func StartNewClient(broadcastPort uint16) *Client {
-	log := logger.New(logger.DEBUG)
+func StartNewClient(broadcastPort uint16, logFilePath string) (*Client, error) {
+	log, err := logger.NewFileLogger(logFilePath, logger.DEBUG)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start client %w", err)
+	}
+
+	log.Info("Starting client")
 	client := &Client{
 		broadcastPort: broadcastPort,
 		clusterView:   NewGroupView(log),
@@ -29,7 +34,8 @@ func StartNewClient(broadcastPort uint16) *Client {
 			client.log.Fatal("Error listening to broadcast: %v", err)
 		}
 	}()
-	return client
+
+	return client, nil
 }
 
 func (c *Client) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {

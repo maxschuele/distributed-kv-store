@@ -10,9 +10,19 @@ import (
 
 func main() {
 	broadcastPortRaw := flag.Uint("broadcast-port", 9998, "Broadcast port")
+	logFilePath := flag.String("log-file", "logs/client.log", "Path to the log file. If not provided, logs to stdout.")
+	flag.Parse()
+
+	if *logFilePath == "" {
+		exit("no log file path provided")
+	}
 
 	broadcastPort := validatePort(*broadcastPortRaw, "broadcast-port")
-	client := node.StartNewClient(broadcastPort)
+
+	client, err := node.StartNewClient(broadcastPort, *logFilePath)
+	if err != nil {
+		exit("Failed to start client: %v", err)
+	}
 
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Println("Echo (Ctrl+C to exit):")
