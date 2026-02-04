@@ -52,7 +52,7 @@ func StartNode(ip string, httpPort uint16, clusterPort uint16, groupPort uint16,
 
 	info := NodeInfo{
 		ID:       uuid.New(),
-		GroupID:  uuid.Nil,
+		GroupID:  uuid.New(),
 		Host:     clusterTcpAddr.Host,
 		Port:     clusterTcpAddr.Port,
 		IsLeader: true,
@@ -64,8 +64,8 @@ func StartNode(ip string, httpPort uint16, clusterPort uint16, groupPort uint16,
 		info:            info,
 		log:             log,
 		httpServer:      httpserver.New(),
-		clusterView:     NewGroupView(log),
-		replicationView: NewGroupView(log),
+		clusterView:     NewGroupView(info.ID, log, ClusterGroupViewType),
+		replicationView: NewGroupView(info.ID, log, ReplicationGroupViewType),
 		storage:         NewStorage(),
 		rw:              sync.RWMutex{},
 		broadcastPort:   broadcastPort,
@@ -96,8 +96,8 @@ func StartNode(ip string, httpPort uint16, clusterPort uint16, groupPort uint16,
 
 	// TODO: add this back in
 	// Start heartbeat monitor
-	go n.clusterView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval)
-	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval)
+	go n.clusterView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.InitiateElection)
+	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.InitiateElection)
 	// go n.startHttpServer(ip, httpPort)
 }
 
@@ -123,9 +123,10 @@ func StartReplicationNode(ip string, clusterPort uint16, broadcastPort uint16) {
 		storage:         NewStorage(),
 		rw:              sync.RWMutex{},
 		broadcastPort:   broadcastPort,
-		replicationView: NewGroupView(log),
+		replicationView: NewGroupView(info.ID, log, ReplicationGroupViewType),
+		clusterView:     NewGroupView(info.ID, log, ClusterGroupViewType),
 	}
-
+	log.Info("starting node %s", info.ID.String())
 	n.clusterListener, err = net.ListenTCP("tcp4", clusterTcpAddr.Addr)
 	if err != nil {
 		log.Fatal("failed to set up cluster listener: %v", err)
@@ -143,10 +144,9 @@ func StartReplicationNode(ip string, clusterPort uint16, broadcastPort uint16) {
 	}()
 
 	go n.sendHeartbeats(n.groupPort)
-	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval)
+	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.InitiateElection)
 
 	go n.listenClusterMessages()
-
 }
 
 func (n *Node) listenClusterMessages() {
@@ -156,12 +156,22 @@ func (n *Node) listenClusterMessages() {
 			n.log.Error("Error accepting cluster tcp connection: %v", err)
 		}
 		go n.handleClusterMessage(conn)
-		conn.Close()
+
 	}
 }
 
 func (n *Node) handleClusterMessage(conn net.Conn) {
+	defer conn.Close()
+	msg, err := Unmarshal(conn)
+	if err != nil {
+		n.log.Error("[Node] Failed to unmarshal cluster messages: %v", err)
+		return
+	}
 
+	switch m := msg.(type) {
+	case *ElectionMessage:
+		n.handleElectionMessage(m)
+	}
 }
 
 func (n *Node) sendHeartbeats(port uint16) {
@@ -175,16 +185,19 @@ func (n *Node) sendHeartbeats(port uint16) {
 	msg := MessageHeartbeat{
 		Info: n.info,
 	}
-
-	buf := make([]byte, header.SizeBytes()+msg.SizeBytes())
-	if err := header.Marshal(buf); err != nil {
-		n.log.Fatal("failed to marshal heartbeat header: %v", err)
-	}
-	if err := msg.Marshal(buf[header.SizeBytes():]); err != nil {
-		n.log.Fatal("failed to marshal heartbeat message: %v", err)
-	}
-
 	for {
+		n.rw.RLock()
+		msg.Info = n.info
+		n.rw.RUnlock()
+
+		buf := make([]byte, header.SizeBytes()+msg.SizeBytes())
+		if err := header.Marshal(buf); err != nil {
+			n.log.Fatal("failed to marshal heartbeat header: %v", err)
+		}
+		if err := msg.Marshal(buf[header.SizeBytes():]); err != nil {
+			n.log.Fatal("failed to marshal heartbeat message: %v", err)
+		}
+
 		if err := broadcast.Send(port, buf); err != nil {
 			n.log.Error("failed to broadcast heartbeat message: %v", err)
 		}
@@ -269,9 +282,10 @@ func (n *Node) handleReplicationBroadcastMessage(buf []byte, remoteAddr *net.UDP
 		return
 	}
 
-	if header.ID == n.info.ID {
-		return
-	}
+	// do not ignore own
+	// if header.ID == n.info.ID {
+	// 	return
+	// }
 
 	payload := buf[header.SizeBytes():]
 
