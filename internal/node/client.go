@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 type Client struct {
@@ -25,7 +27,7 @@ func StartNewClient(broadcastPort uint16, logFilePath string) (*Client, error) {
 	log.Info("Starting client")
 	client := &Client{
 		broadcastPort: broadcastPort,
-		clusterView:   NewGroupView(log),
+		clusterView:   NewGroupView(uuid.Nil, log, ClusterGroupViewType),
 		httpClient:    httpclient.NewClient(),
 		log:           log,
 	}

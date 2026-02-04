@@ -2,44 +2,59 @@ package node
 
 import (
 	"bytes"
+	"distributed-kv-store/internal/broadcast"
+	"distributed-kv-store/internal/httpserver"
+	"time"
 
 	"github.com/google/uuid"
 )
 
 func (n *Node) InitiateElection() {
 	n.rw.Lock()
+
+	// if already participating the node does not need to initiate again
+	if n.info.Participant {
+		n.rw.Unlock()
+		n.log.Debug("[Election] Already participating don't initate election")
+		return
+	}
+
+	// if one node in the group is already a leader it does not need to start a new election
+	if n.hasExistingLeader() {
+		n.rw.Unlock()
+		n.log.Debug("[Election] Leader already exists, skipping initiation")
+		return
+	}
+
 	n.info.Participant = true
 	n.rw.Unlock()
 
 	n.log.Info("[Election] Initiating election")
 
-	msg := &ElectionMessage{
+	n.forwardElectionMessage(&ElectionMessage{
 		CandidateID: n.info.ID,
 		IsLeader:    false,
-	}
-	n.forwardElectionMessage(msg)
+	})
 }
 
 func (n *Node) handleElectionMessage(msg *ElectionMessage) {
 	n.rw.Lock()
 	defer n.rw.Unlock()
 
-	// Case 1: Leader Announcement
+	// Leader Announcement
 	if msg.IsLeader {
 		n.log.Info("[Election] New Leader Announced: %s", msg.CandidateID)
-
 		n.info.Participant = false
 
 		if !n.info.IsLeader {
 			// Find the leader's address in GroupView
-			leaderNode, err := n.clusterView.GetNode(msg.CandidateID)
+			leaderNode, err := n.replicationView.GetNode(msg.CandidateID)
 
 			if err != nil {
 				//TODO
 			}
 
 			n.leaderAddr = formatAddress(leaderNode.Host, leaderNode.Port)
-
 			go n.forwardElectionMessage(msg)
 		} else {
 			n.leaderAddr = formatAddress(n.info.Host, n.info.Port)
@@ -74,6 +89,9 @@ func (n *Node) handleElectionMessage(msg *ElectionMessage) {
 			IsLeader:    true,
 		}
 		go n.forwardElectionMessage(announceMsg)
+
+		// start activites as new leader
+		n.startLeaderActivities()
 	}
 }
 
@@ -88,18 +106,56 @@ func CompareUUID(uuid1 uuid.UUID, uuid2 uuid.UUID) int {
 }
 
 func (n *Node) forwardElectionMessage(msg *ElectionMessage) {
-	// determine successor node within group view
-	successorNode, err := n.clusterView.GetSuccessor(n.info.ID)
-
-	// TODO, what to do if there is no successor found
-	if err != nil {
-		n.log.Error(err.Error())
-	}
-
 	data := msg.Marshal()
-	recipient := formatAddress(successorNode.Host, successorNode.Port)
-	if err := n.sendTcpMessage(recipient, data); err != nil {
-		n.log.Error("[Election] Failed to send message to successor %s: %v", recipient, err)
-		// TODO: think if we resend or send to next
+	for {
+		// determine successor node within group view
+		successorNode, err := n.replicationView.GetSuccessor(n.info.ID)
+		// TODO, what to do if there is no successor found
+		if err != nil {
+			n.log.Error(err.Error())
+			break
+		}
+
+		recipient := formatAddress(successorNode.Host, successorNode.Port)
+		n.log.Info("[Election] sucessor node is %s, sending tcp msg to %s", successorNode.ID.String(), recipient)
+
+		errTCP := n.sendTcpMessage(recipient, data)
+		if errTCP != nil {
+			// try resending
+			n.log.Error("[Election] Failed to send message to successor %s: %v", recipient, err)
+			time.Sleep(HeartbeatTimeout)
+		} else {
+			break
+		}
+
 	}
+}
+
+func (n *Node) startLeaderActivities() {
+	n.log.Info("[Election] Starting Leader activities")
+	// start new http server
+	n.httpServer = httpserver.New()
+
+	// start listening to broadcast port
+	go func() {
+		if err := broadcast.Listen(n.broadcastPort, n.log, n.handleBroadcastMessage); err != nil {
+			n.log.Fatal("Error listening to broadcast: %v", err)
+		}
+	}()
+
+	// start sending heartbeats to other leaders and starting monitor of hearbeats
+	go n.sendHeartbeats(n.broadcastPort)
+	go n.clusterView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.InitiateElection)
+
+	// TODO start httpserver
+	// go n.startHttpServer()
+}
+
+func (n *Node) hasExistingLeader() bool {
+	for _, node := range n.replicationView.GetNodes() {
+		if node.IsLeader {
+			return true
+		}
+	}
+	return false
 }

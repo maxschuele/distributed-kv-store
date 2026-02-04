@@ -11,11 +11,34 @@ import (
 	"github.com/google/uuid"
 )
 
+type InitiateElection func()
+
+// ViewType distinguishes between replication and cluster group views
+type ViewType int
+
+const (
+	ReplicationGroupViewType ViewType = iota
+	ClusterGroupViewType
+)
+
+func (vt ViewType) String() string {
+	switch vt {
+	case ReplicationGroupViewType:
+		return "ReplicationView"
+	case ClusterGroupViewType:
+		return "ClusterView"
+	default:
+		return "UnknownView"
+	}
+}
+
 // GroupView maintains knowledge of all discovered nodes in the group
 type GroupView struct {
-	mu    sync.RWMutex
-	log   *logger.Logger
-	nodes map[uuid.UUID]*NodeRecord // nodeID -> NodeRecord
+	viewType ViewType
+	ownID    uuid.UUID
+	mu       sync.RWMutex
+	log      *logger.Logger
+	nodes    map[uuid.UUID]*NodeRecord // nodeID -> NodeRecord
 }
 
 // NodeRecord stores info about a discovered node
@@ -26,11 +49,13 @@ type NodeRecord struct {
 }
 
 // NewGroupView creates a new group view
-func NewGroupView(log *logger.Logger) *GroupView {
+func NewGroupView(ownID uuid.UUID, log *logger.Logger, viewType ViewType) *GroupView {
 	return &GroupView{
-		mu:    sync.RWMutex{},
-		log:   log,
-		nodes: make(map[uuid.UUID]*NodeRecord),
+		ownID:    ownID,
+		viewType: viewType,
+		mu:       sync.RWMutex{},
+		log:      log,
+		nodes:    make(map[uuid.UUID]*NodeRecord),
 	}
 }
 
@@ -41,16 +66,19 @@ func (gv *GroupView) AddOrUpdateNode(i NodeInfo) {
 
 	if record, exists := gv.nodes[i.ID]; exists {
 		record.LastSeen = time.Now()
-		// TODO: does the node info ever change?
-		// record.Info = i
-		// gv.log.Info("[GroupView] Updated node: %s (last seen: now)\n", i.ID)
+		// Don't overwrite our own node's info
+		if i.ID != gv.ownID {
+			//record.Info = i
+			record.Info.GroupID = i.GroupID
+			record.Info.IsLeader = i.IsLeader
+		}
 	} else {
 		gv.nodes[i.ID] = &NodeRecord{
 			Info:         i,
 			LastSeen:     time.Now(),
 			DiscoveredAt: time.Now(),
 		}
-		gv.log.Info("[GroupView] Discovered new node: %s\n", i.ID.String())
+		gv.log.Info("[%s] Discovered new node: %s", gv.viewType.String(), i.ID.String())
 	}
 }
 
@@ -73,13 +101,13 @@ func (gv *GroupView) GetNode(id uuid.UUID) (NodeInfo, error) {
 
 	record, exists := gv.nodes[id]
 	if !exists {
-		return NodeInfo{}, fmt.Errorf("[GroupView] No entry for Node with UUID %s found", id.String())
+		return NodeInfo{}, fmt.Errorf("[%s] No entry for Node with UUID %s found", gv.viewType.String(), id.String())
 	}
 	return record.Info, nil
 }
 
 // RemoveStaleNodes removes nodes that haven't been seen in timeout duration
-func (gv *GroupView) RemoveStaleNodes(timeout time.Duration) {
+func (gv *GroupView) RemoveStaleNodes(timeout time.Duration, initiateElection InitiateElection) {
 	gv.mu.Lock()
 	defer gv.mu.Unlock()
 
@@ -87,14 +115,19 @@ func (gv *GroupView) RemoveStaleNodes(timeout time.Duration) {
 	removed := 0
 	for nodeID, record := range gv.nodes {
 		if now.Sub(record.LastSeen) > timeout {
+			gv.log.Info("removed node %s isleader: %s", nodeID, record.Info.IsLeader)
+			if record.Info.IsLeader && gv.viewType == ReplicationGroupViewType {
+				// schedule election when leader is removed
+				go initiateElection()
+			}
 			delete(gv.nodes, nodeID)
 			removed++
-			gv.log.Info("[GroupView] Removed stale node: %s (last seen: %v ago)\n", nodeID, now.Sub(record.LastSeen))
+			gv.log.Info("[%s] Removed stale node: %s (last seen: %v ago)", gv.viewType.String(), nodeID, now.Sub(record.LastSeen))
 		}
 	}
 
 	if removed > 0 {
-		gv.log.Info("[GroupView] Removed %d stale nodes\n", removed)
+		gv.log.Info("[%s] Removed %d stale nodes", gv.viewType.String(), removed)
 	}
 }
 
@@ -106,12 +139,12 @@ func (gv *GroupView) Size() int {
 }
 
 // StartHeartbeatMonitor starts a goroutine that periodically removes stale nodes
-func (gv *GroupView) StartHeartbeatMonitor(timeout time.Duration, checkInterval time.Duration) {
+func (gv *GroupView) StartHeartbeatMonitor(timeout time.Duration, checkInterval time.Duration, initiateElection InitiateElection) {
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		gv.RemoveStaleNodes(timeout)
+		gv.RemoveStaleNodes(timeout, initiateElection)
 	}
 }
 
@@ -151,12 +184,28 @@ func (gv *GroupView) SortNodesByID() []NodeInfo {
 
 // GetSuccessor returns the successor node of the given node ID
 func (gv *GroupView) GetSuccessor(id uuid.UUID) (NodeInfo, error) {
-	sortedNodes := gv.SortNodesByID()
-	for i, node := range sortedNodes {
-		if node.ID == id {
-			successorIndex := (i + 1) % len(sortedNodes)
-			return sortedNodes[successorIndex], nil
+	gv.mu.RLock()
+	defer gv.mu.RUnlock()
+
+	if len(gv.nodes) == 0 {
+		return NodeInfo{}, fmt.Errorf("[%s] No Successor found for node with uuid: %s (empty group)", gv.viewType.String(), id.String())
+	}
+
+	// Sort UUIDs
+	ids := make([]uuid.UUID, 0, len(gv.nodes))
+	for nodeID := range gv.nodes {
+		ids = append(ids, nodeID)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		return bytes.Compare(ids[i][:], ids[j][:]) < 0
+	})
+
+	// Find the node and return its successor
+	for i, nodeID := range ids {
+		if nodeID == id {
+			successorIndex := (i + 1) % len(ids)
+			return gv.nodes[ids[successorIndex]].Info, nil
 		}
 	}
-	return NodeInfo{}, fmt.Errorf("[GroupView] No Successor found for node with uuid: %s", id.String())
+	return NodeInfo{}, fmt.Errorf("[%s] No Successor found for node with uuid: %s", gv.viewType.String(), id.String())
 }
