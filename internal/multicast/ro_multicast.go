@@ -28,6 +28,7 @@ type VectorClockMessage struct {
 
 // NegativeAckMessage represents a response message requesting missing messages
 type NegativeAckMessage struct {
+	SenderID    uuid.UUID   // NAK sender (requester)
 	RecipientID uuid.UUID   // Target recipient
 	R           uint32      // Received in message by p
 	RVector     VectorClock // Stored by p for each participant
@@ -63,6 +64,13 @@ type ReliableOrderedMulticast struct {
 	// Logger
 	logger *log.Logger
 
+	// Drop simulation (for testing)
+	dropSeq  map[uuid.UUID]uint32
+	dropUsed map[uuid.UUID]bool
+
+	// Peer unicast ports (to route NAKs correctly)
+	peerUnicastPort map[uuid.UUID]uint16
+
 	// State tracking
 	isRunning bool
 	stopChan  chan struct{}
@@ -71,19 +79,22 @@ type ReliableOrderedMulticast struct {
 // NewReliableOrderedMulticast creates a new instance of reliable ordered multicast
 func NewReliableOrderedMulticast(nodeID uuid.UUID, groupSize int, participants []uuid.UUID, logger *log.Logger) *ReliableOrderedMulticast {
 	rom := &ReliableOrderedMulticast{
-		nodeID:       nodeID,
-		groupSize:    groupSize,
-		participants: make(map[uuid.UUID]bool),
-		Sp:           0,
-		Rq:           make(map[uuid.UUID]uint32),
-		holdback:     make(map[uuid.UUID][]*VectorClockMessage),
-		delivery:     make(chan *VectorClockMessage, 100),
-		sentMessages: make(map[uuid.UUID][]*VectorClockMessage),
-		addrMap:      make(map[uuid.UUID]*net.UDPAddr),
-		addrToUUID:   make(map[string]uuid.UUID),
-		logger:       logger,
-		isRunning:    false,
-		stopChan:     make(chan struct{}),
+		nodeID:          nodeID,
+		groupSize:       groupSize,
+		participants:    make(map[uuid.UUID]bool),
+		Sp:              0,
+		Rq:              make(map[uuid.UUID]uint32),
+		holdback:        make(map[uuid.UUID][]*VectorClockMessage),
+		delivery:        make(chan *VectorClockMessage, 100),
+		sentMessages:    make(map[uuid.UUID][]*VectorClockMessage),
+		addrMap:         make(map[uuid.UUID]*net.UDPAddr),
+		addrToUUID:      make(map[string]uuid.UUID),
+		logger:          logger,
+		isRunning:       false,
+		stopChan:        make(chan struct{}),
+		dropSeq:         make(map[uuid.UUID]uint32),
+		dropUsed:        make(map[uuid.UUID]bool),
+		peerUnicastPort: make(map[uuid.UUID]uint16),
 	}
 
 	// Initialize participants and Rq vector
@@ -95,6 +106,22 @@ func NewReliableOrderedMulticast(nodeID uuid.UUID, groupSize int, participants [
 	}
 
 	return rom
+}
+
+// SetDropSequence configures this ROM instance to drop one message from a sender
+// before processing (useful to trigger retransmission in demos).
+func (rom *ReliableOrderedMulticast) SetDropSequence(senderID uuid.UUID, seq uint32) {
+	rom.mu.Lock()
+	defer rom.mu.Unlock()
+	rom.dropSeq[senderID] = seq
+	rom.dropUsed[senderID] = false
+}
+
+// SetPeerUnicastPort sets the unicast port for a peer to route NAKs/retransmits.
+func (rom *ReliableOrderedMulticast) SetPeerUnicastPort(peerID uuid.UUID, port uint16) {
+	rom.mu.Lock()
+	defer rom.mu.Unlock()
+	rom.peerUnicastPort[peerID] = port
 }
 
 // Start initializes the reliable ordered multicast
@@ -177,7 +204,12 @@ func (rom *ReliableOrderedMulticast) InitializeGroupListener(listenPort int) err
 		return fmt.Errorf("failed to create connection from file: %w", err)
 	}
 
-	rom.groupListenConn = conn.(*net.UDPConn)
+	udpConn, ok := conn.(*net.UDPConn)
+	if !ok {
+		return fmt.Errorf("unexpected conn type %T", conn)
+	}
+
+	rom.groupListenConn = udpConn
 	rom.logger.Printf("[ROM] Initialized group listener on port %d with SO_REUSEADDR and SO_REUSEPORT", listenPort)
 
 	return nil
@@ -222,11 +254,19 @@ func (rom *ReliableOrderedMulticast) InitializeUnicastListener(listenPort int) e
 		return fmt.Errorf("failed to create connection from file: %w", err)
 	}
 
-	rom.unicastConn = conn.(*net.UDPConn)
+	udpConn, ok := conn.(*net.UDPConn)
+	if !ok {
+		return fmt.Errorf("unexpected conn type %T", conn)
+	}
+
+	rom.unicastConn = udpConn
 	rom.logger.Printf("[ROM] Initialized unicast listener on port %d with SO_REUSEADDR and SO_REUSEPORT", listenPort)
 
 	// start unicast read loop to handle incoming messages (NAKs and retransmissions)
-	go func() {
+	go func(conn *net.UDPConn) {
+		if conn == nil {
+			return
+		}
 		buffer := make([]byte, 8192)
 		for {
 			select {
@@ -235,11 +275,17 @@ func (rom *ReliableOrderedMulticast) InitializeUnicastListener(listenPort int) e
 			default:
 			}
 
-			rom.unicastConn.SetReadDeadline(time.Now().Add(1 * time.Second))
-			n, remoteAddr, err := rom.unicastConn.ReadFromUDP(buffer)
+			conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+			n, remoteAddr, err := conn.ReadFromUDP(buffer)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
+				}
+				rom.mu.RLock()
+				running := rom.isRunning
+				rom.mu.RUnlock()
+				if !running {
+					return
 				}
 				rom.logger.Printf("[ROM] unicast read error: %v", err)
 				continue
@@ -270,25 +316,26 @@ func (rom *ReliableOrderedMulticast) InitializeUnicastListener(listenPort int) e
 
 				// If this NAK targets us, attempt to retransmit missing messages to requester
 				if nak.RecipientID == rom.nodeID {
-					rom.mu.RLock()
-					requesterID, ok := rom.addrToUUID[remoteAddr.String()]
-					rom.mu.RUnlock()
-					if !ok {
-						rom.logger.Printf("[ROM] unknown requester address %s for NAK; cannot retransmit", remoteAddr.String())
-						continue
+					requesterID := nak.SenderID
+					addr := remoteAddr
+					rom.mu.Lock()
+					if port, ok := rom.peerUnicastPort[requesterID]; ok {
+						addr = &net.UDPAddr{IP: remoteAddr.IP, Port: int(port)}
 					}
+					rom.addrMap[requesterID] = addr
+					rom.mu.Unlock()
 
 					if err := rom.RetransmitMissingMessages(requesterID, nak.R, nak.RVector); err != nil {
 						rom.logger.Printf("[ROM] RetransmitMissingMessages failed for requester %s: %v", requesterID.String(), err)
 					} else {
-						rom.logger.Printf("[ROM] RetransmitMissingMessages invoked for requester %s (addr=%s) R=%d", requesterID.String(), remoteAddr.String(), nak.R)
+						rom.logger.Printf("[ROM] RetransmitMissingMessages invoked for requester %s (addr=%s) R=%d", requesterID.String(), addr.String(), nak.R)
 					}
 				}
 			default:
 				rom.logger.Printf("[ROM] unknown unicast message type %02x from %s", buffer[0], remoteAddr.String())
 			}
 		}
-	}()
+	}(udpConn)
 
 	return nil
 }
@@ -365,7 +412,11 @@ func (rom *ReliableOrderedMulticast) ReceiveMulticast(msg *VectorClockMessage, r
 
 	// record address <-> uuid mapping for unicast responses
 	if remoteAddr != nil {
-		rom.addrMap[msg.SenderID] = remoteAddr
+		addr := remoteAddr
+		if port, ok := rom.peerUnicastPort[msg.SenderID]; ok {
+			addr = &net.UDPAddr{IP: remoteAddr.IP, Port: int(port)}
+		}
+		rom.addrMap[msg.SenderID] = addr
 		rom.addrToUUID[remoteAddr.String()] = msg.SenderID
 	}
 
@@ -383,10 +434,10 @@ func (rom *ReliableOrderedMulticast) ReceiveMulticast(msg *VectorClockMessage, r
 
 	// Process piggybacked acks and send any generated NAKs back to the sender.
 	naks := rom.processPiggybackedAcks(senderID, msg.VectorClock)
-	if len(naks) > 0 && remoteAddr != nil {
+	if len(naks) > 0 {
 		// release lock while sending network I/O to avoid holding lock for I/O
 		rom.mu.Unlock()
-		rom.sendNAKs(naks, remoteAddr)
+		rom.sendNAKsToSender(senderID, naks, remoteAddr)
 		rom.mu.Lock()
 	}
 
@@ -495,6 +546,7 @@ func (rom *ReliableOrderedMulticast) processPiggybackedAcks(senderID uuid.UUID, 
 		}
 		if R > localRq {
 			nak := &NegativeAckMessage{
+				SenderID:    rom.nodeID,
 				RecipientID: senderID,
 				R:           R,
 				RVector:     rom.copyVectorClock(rom.Rq),
@@ -506,12 +558,20 @@ func (rom *ReliableOrderedMulticast) processPiggybackedAcks(senderID uuid.UUID, 
 	return naks
 }
 
-// sendNAKs marshals and sends NAKs to the provided remote UDP address with proper locking and error handling.
-func (rom *ReliableOrderedMulticast) sendNAKs(naks []*NegativeAckMessage, remoteAddr *net.UDPAddr) {
+// sendNAKsToSender marshals and sends NAKs to the sender's unicast address (or fallback address).
+func (rom *ReliableOrderedMulticast) sendNAKsToSender(senderID uuid.UUID, naks []*NegativeAckMessage, fallback *net.UDPAddr) {
 	rom.mu.RLock()
 	running := rom.isRunning
+	addr := rom.addrMap[senderID]
 	rom.mu.RUnlock()
 	if !running {
+		return
+	}
+	if addr == nil {
+		addr = fallback
+	}
+	if addr == nil {
+		rom.logger.Printf("[ROM] no address for sender %s; cannot send NAK", senderID.String())
 		return
 	}
 
@@ -522,19 +582,19 @@ func (rom *ReliableOrderedMulticast) sendNAKs(naks []*NegativeAckMessage, remote
 			continue
 		}
 
-		conn, err := net.DialUDP("udp", nil, remoteAddr)
+		conn, err := net.DialUDP("udp", nil, addr)
 		if err != nil {
-			rom.logger.Printf("[ROM] failed to dial %s to send NAK: %v", remoteAddr.String(), err)
+			rom.logger.Printf("[ROM] failed to dial %s to send NAK: %v", addr.String(), err)
 			continue
 		}
 
 		_, err = conn.Write(data)
 		conn.Close()
 		if err != nil {
-			rom.logger.Printf("[ROM] failed to send NAK to %s: %v", remoteAddr.String(), err)
+			rom.logger.Printf("[ROM] failed to send NAK to %s: %v", addr.String(), err)
 			continue
 		}
-		rom.logger.Printf("[ROM] Sent NAK to %s (requested R=%d)", remoteAddr.String(), nak.R)
+		rom.logger.Printf("[ROM] Sent NAK to %s (requested R=%d)", addr.String(), nak.R)
 	}
 }
 
@@ -564,19 +624,19 @@ func (rom *ReliableOrderedMulticast) RetransmitMissingMessages(requesterID uuid.
 	}
 	targetAddr = addr
 
-	// For each participant in the received vector, find messages this node has stored that the requester is missing
-	for participant, requesterRq := range rVector {
-		ourRq, exists := rom.Rq[participant]
-		if !exists {
-			continue
-		}
+	// We can only retransmit messages we actually sent (rom.nodeID).
+	// Use our send sequence (Sp) as the upper bound, not Rq.
+	requesterRq := uint32(0)
+	if rv, ok := rVector[rom.nodeID]; ok {
+		requesterRq = rv
+	}
+	ourMax := rom.Sp
+	sentMsgs := rom.sentMessages[rom.nodeID]
 
-		if requesterRq < ourRq {
-			sentMsgs := rom.sentMessages[participant]
-			for _, msg := range sentMsgs {
-				if msg.Sp > requesterRq && msg.Sp <= ourRq {
-					toSend = append(toSend, msg)
-				}
+	if requesterRq < ourMax {
+		for _, msg := range sentMsgs {
+			if msg.Sp > requesterRq && msg.Sp <= ourMax {
+				toSend = append(toSend, msg)
 			}
 		}
 	}
@@ -758,6 +818,13 @@ func MarshalNegativeAckMessage(msg *NegativeAckMessage) ([]byte, error) {
 		return nil, err
 	}
 
+	// Write sender ID (16 bytes for UUID)
+	senderBytes, err := msg.SenderID.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	buf.Write(senderBytes)
+
 	// Write recipient ID (16 bytes for UUID)
 	recipientBytes, err := msg.RecipientID.MarshalBinary()
 	if err != nil {
@@ -796,6 +863,16 @@ func UnmarshalNegativeAckMessage(data []byte) (*NegativeAckMessage, error) {
 		return nil, fmt.Errorf("invalid message type: %d", msgType)
 	}
 
+	// Read sender ID (16 bytes for UUID)
+	senderBytes := make([]byte, 16)
+	if _, err := buf.Read(senderBytes); err != nil {
+		return nil, err
+	}
+	senderID, err := uuid.FromBytes(senderBytes)
+	if err != nil {
+		return nil, err
+	}
+
 	// Read recipient ID (16 bytes for UUID)
 	recipientBytes := make([]byte, 16)
 	if _, err := buf.Read(recipientBytes); err != nil {
@@ -826,6 +903,7 @@ func UnmarshalNegativeAckMessage(data []byte) (*NegativeAckMessage, error) {
 	timestamp := time.Unix(0, unixNano)
 
 	return &NegativeAckMessage{
+		SenderID:    senderID,
 		RecipientID: recipientID,
 		R:           R,
 		RVector:     RVector,
@@ -934,9 +1012,10 @@ func (rom *ReliableOrderedMulticast) ListenToGroup(listenPort int) error {
 		rom.mu.Unlock()
 		return fmt.Errorf("group listener not initialized; call InitializeGroupListener first")
 	}
+	conn := rom.groupListenConn
 	rom.mu.Unlock()
 
-	if err := rom.groupListenConn.SetReadDeadline(time.Time{}); err != nil {
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
 		return fmt.Errorf("failed to set read deadline: %w", err)
 	}
 
@@ -950,11 +1029,17 @@ func (rom *ReliableOrderedMulticast) ListenToGroup(listenPort int) error {
 			default:
 			}
 
-			rom.groupListenConn.SetReadDeadline(time.Now().Add(1 * time.Second))
-			n, remoteAddr, err := rom.groupListenConn.ReadFromUDP(buffer)
+			conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+			n, remoteAddr, err := conn.ReadFromUDP(buffer)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
+				}
+				rom.mu.RLock()
+				running := rom.isRunning
+				rom.mu.RUnlock()
+				if !running {
+					return
 				}
 				rom.logger.Printf("[ROM] Error reading from group: %v", err)
 				continue
@@ -966,6 +1051,18 @@ func (rom *ReliableOrderedMulticast) ListenToGroup(listenPort int) error {
 				rom.logger.Printf("[ROM] Failed to unmarshal message from %s: %v", remoteAddr.String(), err)
 				continue
 			}
+
+			// Optional: drop one message to simulate loss
+			rom.mu.Lock()
+			dropSeq, ok := rom.dropSeq[msg.SenderID]
+			used := rom.dropUsed[msg.SenderID]
+			if ok && !used && msg.Sp == dropSeq {
+				rom.dropUsed[msg.SenderID] = true
+				rom.mu.Unlock()
+				rom.logger.Printf("[ROM] Dropped message %d from %s (simulated loss)", msg.Sp, msg.SenderID.String())
+				continue
+			}
+			rom.mu.Unlock()
 
 			// Process the message through the ROM protocol
 			if err := rom.ReceiveMulticast(msg, remoteAddr); err != nil {
