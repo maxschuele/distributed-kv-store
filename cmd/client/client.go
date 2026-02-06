@@ -2,8 +2,8 @@ package main
 
 import (
 	"bufio"
+	"distributed-kv-store/internal/cluster"
 	"distributed-kv-store/internal/logger"
-	"distributed-kv-store/internal/node"
 	"flag"
 	"fmt"
 	"os"
@@ -26,7 +26,7 @@ func main() {
 
 	broadcastPort := validatePort(*broadcastPortRaw, "broadcast-port")
 
-	client, err := node.StartNewClient(broadcastPort, *logFilePath, logLevel)
+	client, err := cluster.StartNewClient(broadcastPort, *logFilePath, logLevel)
 	if err != nil {
 		exit("Failed to start client: %v", err)
 	}

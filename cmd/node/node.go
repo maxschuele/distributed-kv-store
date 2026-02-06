@@ -1,8 +1,8 @@
 package main
 
 import (
+	"distributed-kv-store/internal/cluster"
 	"distributed-kv-store/internal/logger"
-	"distributed-kv-store/internal/node"
 	"flag"
 	"fmt"
 	"os"
@@ -29,11 +29,11 @@ func main() {
 	clusterPort := validatePort(*clusterPortRaw, "cluster-port")
 
 	if *replication {
-		node.StartReplicationNode(*ip, clusterPort, logLevel)
+		cluster.StartReplicationNode(*ip, clusterPort, logLevel)
 	} else {
 		httpPort := validatePort(*httpPortRaw, "http-port")
 		groupPort := validatePort(*groupPortRaw, "group-port")
-		node.StartNode(*ip, clusterPort, httpPort, groupPort, logLevel)
+		cluster.StartNode(*ip, clusterPort, httpPort, groupPort, logLevel)
 	}
 
 	select {}
