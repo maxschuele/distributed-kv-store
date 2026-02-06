@@ -76,30 +76,9 @@ func StartNode(ip string, clusterPort uint16, httpPort uint16, groupPort uint16,
 		logger.New(logger.DEBUG).Fatal("%v", err)
 	}
 
-	n.httpServer = httpserver.New()
-
 	n.log.Info("starting node %s", n.info.ID.String())
-
-	go n.listenClusterMessages()
-
-	go func() {
-		if err := broadcast.Listen(broadcastPort, n.log, n.handleBroadcastMessage); err != nil {
-			n.log.Fatal("Error listening to broadcast: %v", err)
-		}
-	}()
-
-	go func() {
-		if err := broadcast.Listen(groupPort, n.log, n.handleReplicationBroadcastMessage); err != nil {
-			n.log.Fatal("Error listening to broadcast: %v", err)
-		}
-	}()
-
-	go n.sendHeartbeats(broadcastPort)
-	go n.sendHeartbeats(n.groupPort)
-	go n.clusterView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.InitiateElection)
-	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.InitiateElection)
-
-	go n.startHttpServer()
+	n.startActivities()
+	n.startLeaderActivities()
 }
 
 func StartReplicationNode(ip string, clusterPort uint16, logLevel logger.Level) {
@@ -114,19 +93,10 @@ func StartReplicationNode(ip string, clusterPort uint16, logLevel logger.Level) 
 
 	n.log.Info("starting replication node %s with cluster port %d and broadcast port %d", n.info.ID.String(), clusterPort, broadcastPort)
 
-	for !n.groupJoin() {
+	for !n.replicationGroupJoin() {
 	}
 
-	go n.listenClusterMessages()
-
-	go func() {
-		if err := broadcast.Listen(n.groupPort, n.log, n.handleReplicationBroadcastMessage); err != nil {
-			n.log.Fatal("Error listening to broadcast: %v", err)
-		}
-	}()
-
-	go n.sendHeartbeats(n.groupPort)
-	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.InitiateElection)
+	n.startActivities()
 }
 
 func newBaseNode(cfg nodeConfig) (*Node, error) {
@@ -176,6 +146,34 @@ func newBaseNode(cfg nodeConfig) (*Node, error) {
 	}
 
 	return n, nil
+}
+
+func (n *Node) startActivities() {
+	go n.listenClusterMessages()
+
+	go func() {
+		if err := broadcast.Listen(n.groupPort, n.log, n.handleReplicationBroadcastMessage); err != nil {
+			n.log.Fatal("Error listening to broadcast: %v", err)
+		}
+	}()
+
+	go n.sendHeartbeats(n.groupPort)
+	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.InitiateElection)
+}
+
+func (n *Node) startLeaderActivities() {
+	n.log.Info("Starting leader activities")
+	go func() {
+		if err := broadcast.Listen(broadcastPort, n.log, n.handleBroadcastMessage); err != nil {
+			n.log.Fatal("Error listening to broadcast: %v", err)
+		}
+	}()
+
+	go n.sendHeartbeats(broadcastPort)
+	go n.clusterView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, func() {})
+
+	n.httpServer = httpserver.New()
+	go n.startHttpServer()
 }
 
 func (n *Node) listenClusterMessages() {
@@ -295,6 +293,7 @@ func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 			LeaderHost: n.info.Host,
 			LeaderPort: n.info.Port,
 			GroupPort:  n.groupPort,
+			HttpPort:   n.info.HttpPort,
 		})
 	}
 }
@@ -353,7 +352,7 @@ func (n *Node) sendMsg(addr string, m Message) error {
 	return nil
 }
 
-func (n *Node) groupJoin() bool {
+func (n *Node) replicationGroupJoin() bool {
 	responses := make(map[uuid.UUID]MessageGroupInfo)
 	mu := sync.Mutex{}
 	wg := sync.WaitGroup{}
@@ -486,6 +485,7 @@ func (n *Node) groupJoin() bool {
 
 	selected := responses[selectedID]
 
+	n.info.HttpPort = selected.HttpPort
 	n.groupPort = selected.GroupPort
 	n.info.GroupID = selected.GroupID
 

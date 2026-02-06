@@ -2,8 +2,6 @@ package cluster
 
 import (
 	"bytes"
-	"distributed-kv-store/internal/broadcast"
-	"distributed-kv-store/internal/httpserver"
 	"distributed-kv-store/internal/netutil"
 	"time"
 
@@ -130,26 +128,6 @@ func (n *Node) forwardElectionMessage(msg *ElectionMessage) {
 		}
 
 	}
-}
-
-func (n *Node) startLeaderActivities() {
-	n.log.Info("[Election] Starting Leader activities")
-	// start new http server
-	n.httpServer = httpserver.New()
-
-	// start listening to broadcast port
-	go func() {
-		if err := broadcast.Listen(n.broadcastPort, n.log, n.handleBroadcastMessage); err != nil {
-			n.log.Fatal("Error listening to broadcast: %v", err)
-		}
-	}()
-
-	// start sending heartbeats to other leaders and starting monitor of hearbeats
-	go n.sendHeartbeats(n.broadcastPort)
-	go n.clusterView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.InitiateElection)
-
-	// TODO start httpserver
-	// go n.startHttpServer()
 }
 
 func (n *Node) hasExistingLeader() bool {

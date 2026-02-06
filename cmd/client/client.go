@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-	broadcastPortRaw := flag.Uint("broadcast-port", 9998, "Broadcast port")
+	broadcastPortRaw := flag.Uint("broadcast-port", 9898, "Broadcast port")
 	logFilePath := flag.String("log-file", "logs/client.log", "Path to the log file. If not provided, logs to stdout.")
 	logLevelStr := flag.String("log-level", "INFO", "Log level (DEBUG, INFO, WARN, ERROR)")
 	flag.Parse()

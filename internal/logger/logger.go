@@ -36,7 +36,7 @@ func NewWithWriter(w io.Writer, minLevel Level) *Logger {
 
 func NewFileLogger(filePath string, minLevel Level) (*Logger, error) {
 	dirPath := filepath.Dir(filePath)
-	err := os.Mkdir(dirPath, 0755)
+	err := os.MkdirAll(dirPath, 0755)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to create logger: %w", err)
 	}

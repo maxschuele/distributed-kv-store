@@ -114,6 +114,10 @@ func (gv *GroupView) RemoveStaleNodes(timeout time.Duration, initiateElection In
 	now := time.Now()
 	removed := 0
 	for nodeID, record := range gv.nodes {
+		if nodeID == gv.ownID {
+			continue
+		}
+
 		if now.Sub(record.LastSeen) > timeout {
 			gv.log.Info("removed node %s isleader: %s", nodeID, record.Info.IsLeader)
 			if record.Info.IsLeader && gv.viewType == ReplicationGroupViewType {
@@ -207,5 +211,6 @@ func (gv *GroupView) GetSuccessor(id uuid.UUID) (NodeInfo, error) {
 			return gv.nodes[ids[successorIndex]].Info, nil
 		}
 	}
+
 	return NodeInfo{}, fmt.Errorf("[%s] No Successor found for node with uuid: %s", gv.viewType.String(), id.String())
 }
