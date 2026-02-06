@@ -3,9 +3,9 @@ package multicast
 import (
 	"bytes"
 	"context"
+	"distributed-kv-store/internal/logger"
 	"encoding/binary"
 	"fmt"
-	"log"
 	"net"
 	"sync"
 	"syscall"
@@ -73,7 +73,7 @@ type ReliableFIFOMulticast struct {
 	stopChan  chan struct{}
 
 	// logging
-	logger *log.Logger
+	log *logger.Logger
 
 	// last-ack tracking (leader)
 	lastAck map[uuid.UUID]uint32
@@ -81,7 +81,7 @@ type ReliableFIFOMulticast struct {
 
 // NewReliableFIFOMulticast creates a FIFO-reliable multicast instance.
 // leaderID is the only sender in the group.
-func NewReliableFIFOMulticast(nodeID, leaderID uuid.UUID, participants []uuid.UUID, logger *log.Logger) *ReliableFIFOMulticast {
+func NewReliableFIFOMulticast(nodeID, leaderID uuid.UUID, participants []uuid.UUID, log *logger.Logger) *ReliableFIFOMulticast {
 	rom := &ReliableFIFOMulticast{
 		nodeID:       nodeID,
 		leaderID:     leaderID,
@@ -91,7 +91,7 @@ func NewReliableFIFOMulticast(nodeID, leaderID uuid.UUID, participants []uuid.UU
 		sentMessages: make(map[uint32]*FIFOMessage),
 		addrMap:      make(map[uuid.UUID]*net.UDPAddr),
 		stopChan:     make(chan struct{}),
-		logger:       logger,
+		log:          log,
 		lastAck:      make(map[uuid.UUID]uint32),
 	}
 	for _, id := range participants {
@@ -106,9 +106,9 @@ func NewReliableFIFOMulticastWithLeaderAddr(
 	nodeID, leaderID uuid.UUID,
 	participants []uuid.UUID,
 	leaderAddr *net.UDPAddr,
-	logger *log.Logger,
+	log *logger.Logger,
 ) *ReliableFIFOMulticast {
-	rom := NewReliableFIFOMulticast(nodeID, leaderID, participants, logger)
+	rom := NewReliableFIFOMulticast(nodeID, leaderID, participants, log)
 	if leaderAddr != nil {
 		rom.addrMap[leaderID] = leaderAddr
 	}
@@ -127,8 +127,8 @@ func (rom *ReliableFIFOMulticast) Start() {
 	rom.Rq = 0
 	rom.mu.Unlock()
 
-	if rom.logger != nil {
-		rom.logger.Printf("[FIFO] started for node %s (leader=%s)", rom.nodeID.String(), rom.leaderID.String())
+	if rom.log != nil {
+		rom.log.Info("[FIFO] started for node %s (leader=%s)", rom.nodeID.String(), rom.leaderID.String())
 	}
 }
 
@@ -157,8 +157,8 @@ func (rom *ReliableFIFOMulticast) Stop() {
 	rom.mu.Unlock()
 	close(rom.stopChan)
 
-	if rom.logger != nil {
-		rom.logger.Printf("[FIFO] stopped for node %s", rom.nodeID.String())
+	if rom.log != nil {
+		rom.log.Info("[FIFO] stopped for node %s", rom.nodeID.String())
 	}
 }
 
@@ -180,14 +180,18 @@ func (rom *ReliableFIFOMulticast) InitializeMulticastListener(groupIP string, po
 
 	lc := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
-			var innerErr error
-			if err := c.Control(func(fd uintptr) {
-				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-			}); err != nil {
+			var opErr error
+			err := c.Control(func(fd uintptr) {
+				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+				if opErr != nil {
+					return
+				}
+				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+			})
+			if err != nil {
 				return err
 			}
-			return innerErr
+			return opErr
 		},
 	}
 
@@ -210,6 +214,7 @@ func (rom *ReliableFIFOMulticast) InitializeMulticastListener(groupIP string, po
 	var joinErr error
 	if err := rc.Control(func(fd uintptr) {
 		multi := ip.To4()
+
 		mreq := &unix.IPMreqn{
 			Multiaddr: [4]byte{multi[0], multi[1], multi[2], multi[3]},
 		}
@@ -788,11 +793,4 @@ func UnmarshalLastAckMessage(data []byte) (*LastAckMessage, error) {
 		LastSeq:     last,
 		Timestamp:   time.Unix(0, ts),
 	}, nil
-}
-
-func (rom *ReliableFIFOMulticast) debugf(tag string, format string, args ...interface{}) {
-	if rom.logger == nil {
-		return
-	}
-	rom.logger.Printf("%s "+format, append([]interface{}{tag}, args...)...)
 }
