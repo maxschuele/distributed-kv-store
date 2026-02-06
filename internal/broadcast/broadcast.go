@@ -1,10 +1,11 @@
 package broadcast
 
 import (
+	"context"
 	"distributed-kv-store/internal/logger"
 	"fmt"
 	"net"
-	"os"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -40,40 +41,33 @@ func Send(port uint16, pkt []byte) error {
 
 // Listen listens for incoming broadcast announcements
 func Listen(listenPort uint16, log *logger.Logger, handler BroadcastHandlerFunc) error {
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var opErr error
+			err := c.Control(func(fd uintptr) {
+				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+				if opErr != nil {
+					return
+				}
+				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+			})
+			if err != nil {
+				return err
+			}
+			return opErr
+		},
+	}
 
-	// Create a socket with SO_REUSEADDR and SO_REUSEPORT set before binding
-	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+	pc, err := lc.ListenPacket(context.Background(), "udp4", fmt.Sprintf(":%d", listenPort))
 	if err != nil {
-		return fmt.Errorf("failed to create socket: %w", err)
-	}
-	defer unix.Close(fd)
-
-	// Enable SO_REUSEADDR and SO_REUSEPORT
-	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
-		return fmt.Errorf("failed to set SO_REUSEADDR: %w", err)
+		return fmt.Errorf("failed to set up conn on broadcast port: %w", err)
 	}
 
-	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
-		return fmt.Errorf("failed to set SO_REUSEPORT: %w", err)
+	udpConn, ok := pc.(*net.UDPConn)
+	if !ok {
+		pc.Close()
+		return fmt.Errorf("unexpected packet conn type %T", pc)
 	}
-
-	// Bind to the address
-	addr := unix.SockaddrInet4{Port: int(listenPort)}
-	if err := unix.Bind(fd, &addr); err != nil {
-		return fmt.Errorf("failed to bind socket: %w", err)
-	}
-
-	// Convert to net.UDPConn
-	file := os.NewFile(uintptr(fd), "")
-	defer file.Close()
-
-	conn, err := net.FilePacketConn(file)
-	if err != nil {
-		return fmt.Errorf("failed to create connection from file: %w", err)
-	}
-	defer conn.Close()
-
-	udpConn := conn.(*net.UDPConn)
 
 	buf := make([]byte, MaxDatagramSize)
 	for {
