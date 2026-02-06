@@ -18,8 +18,8 @@ type Client struct {
 	httpClient    *httpclient.Client
 }
 
-func StartNewClient(broadcastPort uint16, logFilePath string) (*Client, error) {
-	log, err := logger.NewFileLogger(logFilePath, logger.DEBUG)
+func StartNewClient(broadcastPort uint16, logFilePath string, logLevel logger.Level) (*Client, error) {
+	log, err := logger.NewFileLogger(logFilePath, logLevel)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start client %w", err)
 	}

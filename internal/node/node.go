@@ -5,6 +5,7 @@ import (
 	"distributed-kv-store/internal/broadcast"
 	"distributed-kv-store/internal/httpserver"
 	"distributed-kv-store/internal/logger"
+	"distributed-kv-store/internal/netutil"
 	"fmt"
 	"io"
 	"net"
@@ -15,8 +16,9 @@ import (
 )
 
 const (
-	HeartbeatInterval = 2 * time.Second
-	HeartbeatTimeout  = 8 * time.Second
+	HeartbeatInterval        = 2 * time.Second
+	HeartbeatTimeout         = 8 * time.Second
+	broadcastPort     uint16 = 9898
 )
 
 type NodeInfo struct {
@@ -41,43 +43,42 @@ type Node struct {
 	leaderAddr      string
 	broadcastPort   uint16
 	groupPort       uint16
+	iface           *net.Interface
 }
 
-func StartNode(ip string, httpPort uint16, clusterPort uint16, groupPort uint16, broadcastPort uint16) {
-	log := logger.New(logger.DEBUG)
+type nodeConfig struct {
+	ip          string
+	clusterPort uint16
+	httpPort    uint16
+	groupPort   uint16
+	isLeader    bool
+	logLevel    logger.Level
+}
 
-	clusterTcpAddr, err := parseTcp4Addr(fmt.Sprintf("%s:%d", ip, clusterPort))
+func StartNode(ip string, clusterPort uint16, httpPort uint16, groupPort uint16, logLevel logger.Level) {
+	if err := netutil.ValidatePort(httpPort); err != nil {
+		logger.New(logger.DEBUG).Fatal("invalid http port: %v", err)
+	}
+
+	if err := netutil.ValidatePort(groupPort); err != nil {
+		logger.New(logger.DEBUG).Fatal("invalid group port: %v", err)
+	}
+
+	n, err := newBaseNode(nodeConfig{
+		ip:          ip,
+		clusterPort: clusterPort,
+		httpPort:    httpPort,
+		groupPort:   groupPort,
+		isLeader:    true,
+		logLevel:    logLevel,
+	})
 	if err != nil {
-		log.Fatal("invalid cluster address: %v", err)
+		logger.New(logger.DEBUG).Fatal("%v", err)
 	}
 
-	info := NodeInfo{
-		ID:       uuid.New(),
-		GroupID:  uuid.New(),
-		Host:     clusterTcpAddr.Host,
-		Port:     clusterTcpAddr.Port,
-		HttpPort: httpPort,
-		IsLeader: true,
-	}
+	n.httpServer = httpserver.New()
 
-	log.Info("starting node %s", info.ID.String())
-
-	n := &Node{
-		info:            info,
-		log:             log,
-		httpServer:      httpserver.New(),
-		clusterView:     NewGroupView(info.ID, log, ClusterGroupViewType),
-		replicationView: NewGroupView(info.ID, log, ReplicationGroupViewType),
-		storage:         NewStorage(),
-		rw:              sync.RWMutex{},
-		broadcastPort:   broadcastPort,
-		groupPort:       groupPort,
-	}
-
-	n.clusterListener, err = net.ListenTCP("tcp4", clusterTcpAddr.Addr)
-	if err != nil {
-		log.Fatal("failed to set up cluster listener: %v", err)
-	}
+	n.log.Info("starting node %s", n.info.ID.String())
 
 	go n.listenClusterMessages()
 
@@ -93,51 +94,30 @@ func StartNode(ip string, httpPort uint16, clusterPort uint16, groupPort uint16,
 		}
 	}()
 
-	go n.sendHeartbeats(n.broadcastPort)
+	go n.sendHeartbeats(broadcastPort)
 	go n.sendHeartbeats(n.groupPort)
-
-	// TODO: add this back in
-	// Start heartbeat monitor
 	go n.clusterView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.InitiateElection)
 	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.InitiateElection)
-	go n.startHttpServer(ip, httpPort)
+
+	go n.startHttpServer()
 }
 
-func StartReplicationNode(ip string, clusterPort uint16, broadcastPort uint16) {
-	log := logger.New(logger.DEBUG)
-
-	clusterTcpAddr, err := parseTcp4Addr(fmt.Sprintf("%s:%d", ip, clusterPort))
+func StartReplicationNode(ip string, clusterPort uint16, logLevel logger.Level) {
+	n, err := newBaseNode(nodeConfig{
+		ip:          ip,
+		clusterPort: clusterPort,
+		logLevel:    logLevel,
+	})
 	if err != nil {
-		log.Fatal("invalid cluster address: %v", err)
+		logger.New(logger.DEBUG).Fatal("%v", err)
 	}
 
-	info := NodeInfo{
-		ID:       uuid.New(),
-		GroupID:  uuid.Nil,
-		Host:     clusterTcpAddr.Host,
-		Port:     clusterTcpAddr.Port,
-		IsLeader: false,
+	n.log.Info("starting replication node %s with cluster port %d and broadcast port %d", n.info.ID.String(), clusterPort, broadcastPort)
+
+	for !n.groupJoin() {
 	}
 
-	n := &Node{
-		info:            info,
-		log:             log,
-		storage:         NewStorage(),
-		rw:              sync.RWMutex{},
-		broadcastPort:   broadcastPort,
-		replicationView: NewGroupView(info.ID, log, ReplicationGroupViewType),
-		clusterView:     NewGroupView(info.ID, log, ClusterGroupViewType),
-	}
-	log.Info("starting node %s", info.ID.String())
-	n.clusterListener, err = net.ListenTCP("tcp4", clusterTcpAddr.Addr)
-	if err != nil {
-		log.Fatal("failed to set up cluster listener: %v", err)
-	}
-
-	joined := false
-	for !joined {
-		joined = n.groupJoin()
-	}
+	go n.listenClusterMessages()
 
 	go func() {
 		if err := broadcast.Listen(n.groupPort, n.log, n.handleReplicationBroadcastMessage); err != nil {
@@ -147,8 +127,55 @@ func StartReplicationNode(ip string, clusterPort uint16, broadcastPort uint16) {
 
 	go n.sendHeartbeats(n.groupPort)
 	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.InitiateElection)
+}
 
-	go n.listenClusterMessages()
+func newBaseNode(cfg nodeConfig) (*Node, error) {
+	log := logger.New(cfg.logLevel)
+
+	iface, ip, err := netutil.FindInterfaceByIP(cfg.ip)
+	if err != nil {
+		return nil, fmt.Errorf("invalid ip: %w", err)
+	}
+
+	if err := netutil.ValidatePort(cfg.clusterPort); err != nil {
+		return nil, fmt.Errorf("invalid cluster port: %w", err)
+	}
+
+	info := NodeInfo{
+		ID:       uuid.New(),
+		Host:     ip,
+		Port:     cfg.clusterPort,
+		HttpPort: cfg.httpPort,
+		IsLeader: cfg.isLeader,
+	}
+	if cfg.isLeader {
+		info.GroupID = uuid.New()
+	}
+
+	n := &Node{
+		info:            info,
+		log:             log,
+		clusterView:     NewGroupView(info.ID, log, ClusterGroupViewType),
+		replicationView: NewGroupView(info.ID, log, ReplicationGroupViewType),
+		storage:         NewStorage(),
+		broadcastPort:   broadcastPort,
+		groupPort:       cfg.groupPort,
+		iface:           iface,
+	}
+
+	// TODO: add self to clusterView and replicationView
+
+	clusterTcpAddr, err := netutil.ParseTcp4Addr(ip, cfg.clusterPort)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse cluster tcp address: %w", err)
+	}
+
+	n.clusterListener, err = net.ListenTCP("tcp4", clusterTcpAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to set up cluster listener: %w", err)
+	}
+
+	return n, nil
 }
 
 func (n *Node) listenClusterMessages() {
@@ -262,7 +289,7 @@ func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 			return
 		}
 
-		n.sendMsg(formatAddress(msg.Host, msg.Port), &MessageGroupInfo{
+		n.sendMsg(netutil.FormatAddress(msg.Host, msg.Port), &MessageGroupInfo{
 			GroupID:    n.info.GroupID,
 			GroupSize:  uint32(n.replicationView.Size()), // TODO: fix cast
 			LeaderHost: n.info.Host,
@@ -425,7 +452,7 @@ func (n *Node) groupJoin() bool {
 	}
 
 	for range 4 {
-		if err := broadcast.Send(n.broadcastPort, buf); err != nil {
+		if err := broadcast.Send(broadcastPort, buf); err != nil {
 			n.log.Error("failed to send group join broadcast message: %v", err)
 		}
 		n.log.Info("sent group join broadcast message")
@@ -473,23 +500,21 @@ func (n *Node) groupJoin() bool {
 	return true
 }
 
-func (n *Node) startHttpServer(ip string, port uint16) {
-	httpAddr, err := parseTcp4Addr(fmt.Sprintf("%s:%d", ip, port))
+func (n *Node) startHttpServer() {
+	httpAddr, err := netutil.ParseTcp4Addr(n.info.Host, n.info.HttpPort)
 	if err != nil {
-		n.log.Fatal("invalid HTTP address: %v", err)
+		n.log.Fatal("invalid HTTp address: %v", err)
 	}
 
-	if err := n.httpServer.Bind(httpAddr.Addr); err != nil {
+	if err := n.httpServer.Bind(httpAddr); err != nil {
 		n.log.Fatal("failed to start http server: %v", err)
 	}
 	n.httpServer.RegisterHandler(httpserver.GET, "/kv", n.handleGetKey)
 	n.httpServer.RegisterHandler(httpserver.PUT, "/kv", n.handlePutKey)
 	n.httpServer.RegisterHandler(httpserver.DELETE, "/kv", n.handleDeleteKey)
 
-	for {
-		if err := n.httpServer.Listen(); err != nil {
-			n.log.Error("[Node] Error in HTTP Listen: %v", err)
-		}
+	if err := n.httpServer.Listen(); err != nil {
+		n.log.Error("[Node] Error in HTTP Listen: %v", err)
 	}
 }
 

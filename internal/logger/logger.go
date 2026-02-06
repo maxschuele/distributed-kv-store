@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 type Level int
@@ -78,4 +79,19 @@ func (l *Logger) Error(msg string, args ...any) {
 
 func (l *Logger) SetLevel(level Level) {
 	l.minLevel = level
+}
+
+func ParseLevel(s string) (Level, error) {
+	switch strings.ToUpper(s) {
+	case "DEBUG":
+		return DEBUG, nil
+	case "INFO":
+		return INFO, nil
+	case "WARN":
+		return WARN, nil
+	case "ERROR":
+		return ERROR, nil
+	default:
+		return 0, fmt.Errorf("unknown log level: %q (valid: DEBUG, INFO, WARN, ERROR)", s)
+	}
 }

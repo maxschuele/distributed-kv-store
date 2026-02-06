@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"distributed-kv-store/internal/broadcast"
 	"distributed-kv-store/internal/httpserver"
+	"distributed-kv-store/internal/netutil"
 	"time"
 
 	"github.com/google/uuid"
@@ -54,10 +55,10 @@ func (n *Node) handleElectionMessage(msg *ElectionMessage) {
 				//TODO
 			}
 
-			n.leaderAddr = formatAddress(leaderNode.Host, leaderNode.Port)
+			n.leaderAddr = netutil.FormatAddress(leaderNode.Host, leaderNode.Port)
 			go n.forwardElectionMessage(msg)
 		} else {
-			n.leaderAddr = formatAddress(n.info.Host, n.info.Port)
+			n.leaderAddr = netutil.FormatAddress(n.info.Host, n.info.Port)
 		}
 		return
 	}
@@ -116,7 +117,7 @@ func (n *Node) forwardElectionMessage(msg *ElectionMessage) {
 			break
 		}
 
-		recipient := formatAddress(successorNode.Host, successorNode.Port)
+		recipient := netutil.FormatAddress(successorNode.Host, successorNode.Port)
 		n.log.Info("[Election] sucessor node is %s, sending tcp msg to %s", successorNode.ID.String(), recipient)
 
 		errTCP := n.sendTcpMessage(recipient, data)

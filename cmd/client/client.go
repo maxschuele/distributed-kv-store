@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"distributed-kv-store/internal/logger"
 	"distributed-kv-store/internal/node"
 	"flag"
 	"fmt"
@@ -11,15 +12,21 @@ import (
 func main() {
 	broadcastPortRaw := flag.Uint("broadcast-port", 9998, "Broadcast port")
 	logFilePath := flag.String("log-file", "logs/client.log", "Path to the log file. If not provided, logs to stdout.")
+	logLevelStr := flag.String("log-level", "INFO", "Log level (DEBUG, INFO, WARN, ERROR)")
 	flag.Parse()
 
 	if *logFilePath == "" {
 		exit("no log file path provided")
 	}
 
+	logLevel, err := logger.ParseLevel(*logLevelStr)
+	if err != nil {
+		exit("Error: %v\n", err)
+	}
+
 	broadcastPort := validatePort(*broadcastPortRaw, "broadcast-port")
 
-	client, err := node.StartNewClient(broadcastPort, *logFilePath)
+	client, err := node.StartNewClient(broadcastPort, *logFilePath, logLevel)
 	if err != nil {
 		exit("Failed to start client: %v", err)
 	}

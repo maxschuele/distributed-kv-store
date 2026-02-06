@@ -1,6 +1,7 @@
 package main
 
 import (
+	"distributed-kv-store/internal/logger"
 	"distributed-kv-store/internal/node"
 	"flag"
 	"fmt"
@@ -13,22 +14,26 @@ func main() {
 	httpPortRaw := flag.Uint("http-port", 0, "HTTP server address")
 	clusterPortRaw := flag.Uint("cluster-port", 0, "Cluster communication address")
 	groupPortRaw := flag.Uint("group-port", 0, "Group port")
-	broadcastPortRaw := flag.Uint("broadcast-port", 9998, "Broadcast port")
+	logLevelStr := flag.String("log-level", "INFO", "Log level (DEBUG, INFO, WARN, ERROR)")
 	flag.Parse()
 
 	if *ip == "" {
 		exit("Error: -ip flag is required\n")
 	}
 
+	logLevel, err := logger.ParseLevel(*logLevelStr)
+	if err != nil {
+		exit("Error: %v\n", err)
+	}
+
 	clusterPort := validatePort(*clusterPortRaw, "cluster-port")
-	broadcastPort := validatePort(*broadcastPortRaw, "broadcast-port")
 
 	if *replication {
-		node.StartReplicationNode(*ip, clusterPort, broadcastPort)
+		node.StartReplicationNode(*ip, clusterPort, logLevel)
 	} else {
 		httpPort := validatePort(*httpPortRaw, "http-port")
 		groupPort := validatePort(*groupPortRaw, "group-port")
-		node.StartNode(*ip, httpPort, clusterPort, groupPort, broadcastPort)
+		node.StartNode(*ip, clusterPort, httpPort, groupPort, logLevel)
 	}
 
 	select {}
