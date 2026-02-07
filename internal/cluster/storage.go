@@ -2,8 +2,6 @@ package cluster
 
 import "maps"
 
-import "maps"
-
 import "sync"
 
 type Storage struct {

@@ -8,7 +8,7 @@ import (
 	"github.com/google/uuid"
 )
 
-func (n *Node) InitiateElection() {
+func (n *Node) initiateElection() {
 	n.rw.Lock()
 
 	// if already participating the node does not need to initiate again

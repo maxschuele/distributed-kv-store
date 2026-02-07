@@ -2,18 +2,19 @@ package cluster
 
 import (
 	"distributed-kv-store/internal/broadcast"
+	"distributed-kv-store/internal/consistent"
 	"distributed-kv-store/internal/httpclient"
 	"distributed-kv-store/internal/logger"
+	"distributed-kv-store/internal/netutil"
 	"fmt"
 	"net"
 	"strings"
-
-	"github.com/google/uuid"
 )
 
 type Client struct {
 	broadcastPort uint16
-	clusterView   *GroupView
+	clusterView   *ClusterView
+	consistent    *consistent.ConsistentHash
 	log           *logger.Logger
 	httpClient    *httpclient.Client
 }
@@ -27,15 +28,19 @@ func StartNewClient(broadcastPort uint16, logFilePath string, logLevel logger.Le
 	log.Info("Starting client")
 	client := &Client{
 		broadcastPort: broadcastPort,
-		clusterView:   NewGroupView(uuid.Nil, log, ClusterGroupViewType),
+		clusterView:   NewClusterView(log),
+		consistent:    consistent.NewConsistentHash(150),
 		httpClient:    httpclient.NewClient(),
 		log:           log,
 	}
+
 	go func() {
 		if err := broadcast.Listen(broadcastPort, client.log, client.handleBroadcastMessage); err != nil {
 			client.log.Fatal("Error listening to broadcast: %v", err)
 		}
 	}()
+
+	go client.clusterView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, client.handleNodeRemoval)
 
 	return client, nil
 }
@@ -59,23 +64,38 @@ func (c *Client) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 			return
 		}
 		c.clusterView.AddOrUpdateNode(msg.Info)
+		c.consistent.AddNode(msg.Info.GroupID)
 	}
 }
 
+func (c *Client) handleNodeRemoval(removedNode NodeInfo) {
+	c.log.Info("Removing node %s from hashing ring", removedNode.GroupID.String())
+	c.consistent.RemoveNode(removedNode.GroupID)
+}
+
 func (c *Client) ProcessInput(input string) {
-	command, values, found := strings.Cut(input, " ")
-	if !found {
-		fmt.Println("invalid command")
-		return
-	}
+	command, values, _ := strings.Cut(input, " ")
+
 	switch command {
+	case "LIST":
+		if values != "" {
+			fmt.Println("error: LIST takes no arguments")
+			return
+		}
+		c.doList()
+
 	case "GET":
+		if values == "" {
+			fmt.Println("error: GET requires a key")
+			return
+		}
 		key, _, found := strings.Cut(values, " ")
 		if found {
-			fmt.Println("error: GET takes only a key, no extra arguments")
+			fmt.Println("error: GET takes only one key")
 			return
 		}
 		c.doGet(key)
+
 	case "PUT":
 		key, value, found := strings.Cut(values, " ")
 		if !found {
@@ -83,52 +103,62 @@ func (c *Client) ProcessInput(input string) {
 			return
 		}
 		c.doPut(key, value)
+
 	case "DELETE":
+		if values == "" {
+			fmt.Println("error: DELETE requires a key")
+			return
+		}
 		key, _, found := strings.Cut(values, " ")
 		if found {
-			fmt.Println("error: DELETE takes only a key, no extra arguments")
+			fmt.Println("error: DELETE takes only one key")
 			return
 		}
 		c.doDelete(key)
+
 	default:
 		fmt.Println("invalid command")
 	}
 }
 
-// pickNode returns the address of an available node, or empty string if none.
-func (c *Client) pickNode() string {
-	nodes := c.clusterView.GetNodes()
-	if len(nodes) == 0 {
-		return ""
+func (c *Client) pickNode(key string) (NodeInfo, string, error) {
+	id, err := c.consistent.GetNode(key)
+	if err != nil {
+		return NodeInfo{}, "", err
 	}
-	node := nodes[0]
-	return fmt.Sprintf("%s:%d", node.HostString(), node.HttpPort)
+
+	node, err := c.clusterView.GetNode(id)
+	if err != nil {
+		return NodeInfo{}, "", err
+	}
+
+	return node, netutil.FormatAddress(node.Host, node.HttpPort), nil
 }
 
 func (c *Client) doGet(key string) {
-	addr := c.pickNode()
-	if addr == "" {
-		fmt.Println("error: no nodes available")
-		return
+	node, addr, err := c.pickNode(key)
+	if err != nil {
+		fmt.Printf("failed to pick node: %v\n", err)
 	}
+
 	resp, err := c.httpClient.Get(addr, "/kv?key="+key)
 	if err != nil {
 		c.log.Error("GET failed: %v", err)
 		return
 	}
 	if resp.StatusCode != 200 {
-		fmt.Printf("error %d: %s\n", resp.StatusCode, resp.Body)
+		fmt.Printf("error %d: %s | node: %s\n", resp.StatusCode, resp.Body, node.GroupID.String())
 		return
 	}
-	fmt.Println(resp.Body)
+	fmt.Printf("%s | node: %s\n", resp.Body, node.GroupID.String())
 }
 
 func (c *Client) doPut(key, value string) {
-	addr := c.pickNode()
-	if addr == "" {
-		fmt.Println("error: no nodes available")
-		return
+	node, addr, err := c.pickNode(key)
+	if err != nil {
+		fmt.Printf("failed to pick node: %v\n", err)
 	}
+
 	resp, err := c.httpClient.Put(addr, "/kv?key="+key, value)
 	if err != nil {
 		c.log.Error("PUT failed: %v", err)
@@ -138,15 +168,15 @@ func (c *Client) doPut(key, value string) {
 		fmt.Printf("error %d: %s\n", resp.StatusCode, resp.Body)
 		return
 	}
-	fmt.Println("OK")
+	fmt.Printf("OK | node: %s\n", node.GroupID.String())
 }
 
 func (c *Client) doDelete(key string) {
-	addr := c.pickNode()
-	if addr == "" {
-		fmt.Println("error: no nodes available")
-		return
+	node, addr, err := c.pickNode(key)
+	if err != nil {
+		fmt.Printf("failed to pick node: %v\n", err)
 	}
+
 	resp, err := c.httpClient.Delete(addr, "/kv?key="+key)
 	if err != nil {
 		c.log.Error("DELETE failed: %v", err)
@@ -156,9 +186,14 @@ func (c *Client) doDelete(key string) {
 		fmt.Printf("error %d: %s\n", resp.StatusCode, resp.Body)
 		return
 	}
-	fmt.Println("OK")
+
+	fmt.Printf("OK | node: %s\n", node.GroupID.String())
 }
 
-func (n *NodeInfo) HostString() string {
-	return fmt.Sprintf("%d.%d.%d.%d", n.Host[0], n.Host[1], n.Host[2], n.Host[3])
+func (c *Client) doList() {
+	nodes := c.clusterView.GetNodes()
+
+	for _, node := range nodes {
+		fmt.Printf("%s  %s\n", node.GroupID.String(), netutil.FormatAddress(node.Host, node.HttpPort))
+	}
 }

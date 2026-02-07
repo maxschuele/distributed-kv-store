@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"distributed-kv-store/internal/broadcast"
+	"distributed-kv-store/internal/consistent"
 	"distributed-kv-store/internal/httpserver"
 	"distributed-kv-store/internal/logger"
 	"distributed-kv-store/internal/netutil"
@@ -35,9 +36,10 @@ type Node struct {
 	info            NodeInfo
 	log             *logger.Logger
 	httpServer      *httpserver.Server
-	clusterView     *GroupView
+	clusterView     *ClusterView
 	replicationView *GroupView
 	clusterListener *net.TCPListener
+	connsistent     *consistent.ConsistentHash
 	storage         *Storage
 	rw              sync.RWMutex
 	leaderAddr      string
@@ -76,7 +78,9 @@ func StartNode(ip string, clusterPort uint16, httpPort uint16, groupPort uint16,
 		logger.New(logger.DEBUG).Fatal("%v", err)
 	}
 
-	n.log.Info("starting node %s", n.info.ID.String())
+	n.info.GroupID = uuid.New()
+
+	n.log.Info("starting node groupID: %s ID: %s", n.info.GroupID.String(), n.info.ID.String())
 	n.startActivities()
 	n.startLeaderActivities()
 }
@@ -125,15 +129,17 @@ func newBaseNode(cfg nodeConfig) (*Node, error) {
 	n := &Node{
 		info:            info,
 		log:             log,
-		clusterView:     NewGroupView(info.ID, log, ClusterGroupViewType),
-		replicationView: NewGroupView(info.ID, log, ReplicationGroupViewType),
+		clusterView:     NewClusterView(log),
+		replicationView: NewGroupView(info.ID, log),
+		connsistent:     consistent.NewConsistentHash(150),
 		storage:         NewStorage(),
 		broadcastPort:   broadcastPort,
 		groupPort:       cfg.groupPort,
 		iface:           iface,
 	}
 
-	// TODO: add self to clusterView and replicationView
+	// add self to replication view (needed for election)
+	n.replicationView.AddOrUpdateNode(info)
 
 	clusterTcpAddr, err := netutil.ParseTcp4Addr(ip, cfg.clusterPort)
 	if err != nil {
@@ -158,11 +164,14 @@ func (n *Node) startActivities() {
 	}()
 
 	go n.sendHeartbeats(n.groupPort)
-	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.InitiateElection)
+	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.handleReplicationGroupNodeRemoval)
 }
 
 func (n *Node) startLeaderActivities() {
 	n.log.Info("Starting leader activities")
+
+	n.connsistent.AddNode(n.info.GroupID)
+
 	go func() {
 		if err := broadcast.Listen(broadcastPort, n.log, n.handleBroadcastMessage); err != nil {
 			n.log.Fatal("Error listening to broadcast: %v", err)
@@ -170,10 +179,21 @@ func (n *Node) startLeaderActivities() {
 	}()
 
 	go n.sendHeartbeats(broadcastPort)
-	go n.clusterView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, func() {})
+	go n.clusterView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.handleClusterGroupNodeRemoval)
 
 	n.httpServer = httpserver.New()
 	go n.startHttpServer()
+}
+
+func (n *Node) handleReplicationGroupNodeRemoval(removedNode NodeInfo) {
+	if removedNode.IsLeader {
+		n.initiateElection()
+	}
+}
+
+func (n *Node) handleClusterGroupNodeRemoval(removedNode NodeInfo) {
+	n.log.Info("Removing node %s from hashing ring", removedNode.GroupID.String())
+	n.connsistent.RemoveNode(removedNode.GroupID)
 }
 
 func (n *Node) listenClusterMessages() {
@@ -276,6 +296,7 @@ func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 		}
 
 		n.clusterView.AddOrUpdateNode(msg.Info)
+		n.connsistent.AddNode(msg.Info.GroupID)
 	case MessageTypeGroupJoin:
 		if !n.info.IsLeader {
 			return
@@ -310,10 +331,9 @@ func (n *Node) handleReplicationBroadcastMessage(buf []byte, remoteAddr *net.UDP
 		return
 	}
 
-	// do not ignore own
-	// if header.ID == n.info.ID {
-	// 	return
-	// }
+	if header.ID == n.info.ID {
+		return
+	}
 
 	payload := buf[header.SizeBytes():]
 
