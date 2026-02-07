@@ -6,11 +6,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"syscall"
 	"time"
+
+	"distributed-kv-store/internal/logger"
 
 	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
@@ -128,7 +129,7 @@ type ReliableFIFOMulticast struct {
 	stopChan  chan struct{}
 
 	// logging
-	logger *log.Logger
+	log *logger.Logger
 
 	// last-ack tracking (leader)
 	lastAck map[uuid.UUID]uint32
@@ -145,7 +146,7 @@ type ReliableFIFOMulticast struct {
 
 // NewReliableFIFOMulticast creates a FIFO-reliable multicast instance.
 // leaderID is the only sender in the group.
-func NewReliableFIFOMulticast(nodeID, leaderID uuid.UUID, participants []uuid.UUID, logger *log.Logger) *ReliableFIFOMulticast {
+func NewReliableFIFOMulticast(nodeID, leaderID uuid.UUID, participants []uuid.UUID, logger *logger.Logger) *ReliableFIFOMulticast {
 	rom := &ReliableFIFOMulticast{
 		nodeID:       nodeID,
 		leaderID:     leaderID,
@@ -155,7 +156,7 @@ func NewReliableFIFOMulticast(nodeID, leaderID uuid.UUID, participants []uuid.UU
 		sentMessages: make(map[uint32]*FIFOMessage),
 		addrMap:      make(map[uuid.UUID]*net.UDPAddr),
 		stopChan:     make(chan struct{}),
-		logger:       logger,
+		log:          logger,
 		lastAck:      make(map[uuid.UUID]uint32),
 	}
 	for _, id := range participants {
@@ -170,7 +171,7 @@ func NewReliableFIFOMulticastWithLeaderAddr(
 	nodeID, leaderID uuid.UUID,
 	participants []uuid.UUID,
 	leaderAddr *net.UDPAddr,
-	logger *log.Logger,
+	logger *logger.Logger,
 ) *ReliableFIFOMulticast {
 	rom := NewReliableFIFOMulticast(nodeID, leaderID, participants, logger)
 	if leaderAddr != nil {
@@ -206,8 +207,8 @@ func (rom *ReliableFIFOMulticast) Start() {
 	rom.startLeaderHeartbeat()
 	rom.startPeerSummaryRelay()
 
-	if rom.logger != nil {
-		rom.logger.Printf("[FIFO] started for node %s (leader=%s)", rom.nodeID.String(), rom.leaderID.String())
+	if rom.log != nil {
+		rom.log.Info("[FIFO] started for node %s (leader=%s)", rom.nodeID.String(), rom.leaderID.String())
 	}
 }
 
@@ -315,8 +316,8 @@ func (rom *ReliableFIFOMulticast) Stop() {
 	rom.mu.Unlock()
 	close(rom.stopChan)
 
-	if rom.logger != nil {
-		rom.logger.Printf("[FIFO] stopped for node %s", rom.nodeID.String())
+	if rom.log != nil {
+		rom.log.Info("[FIFO] stopped for node %s", rom.nodeID.String())
 	}
 }
 

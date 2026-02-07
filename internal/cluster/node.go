@@ -5,6 +5,7 @@ import (
 	"distributed-kv-store/internal/broadcast"
 	"distributed-kv-store/internal/httpserver"
 	"distributed-kv-store/internal/logger"
+	"distributed-kv-store/internal/multicast"
 	"distributed-kv-store/internal/netutil"
 	"fmt"
 	"io"
@@ -159,6 +160,72 @@ func (n *Node) startActivities() {
 
 	go n.sendHeartbeats(n.groupPort)
 	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.InitiateElection)
+}
+
+// TODO: handle payload
+func (n *Node) multicastReceiveAndRetransmit() {
+	leaderId := n.getLeaderId()
+	multicastMembers := n.getReplicationGroupParticipants()
+	leaderAddr := n.getLeaderAddr()
+
+	rom := multicast.NewReliableFIFOMulticastWithLeaderAddr(n.info.ID, leaderId, multicastMembers, leaderAddr, n.log)
+	rom.Start()
+
+	go rom.InitializeUnicastListener(int(n.info.Port))
+	go rom.InitializeMulticastListenerOnPort(int(n.groupPort))
+	time.Sleep(100 * time.Millisecond)
+
+	delivered := 0
+	go func() {
+		for msg := range rom.GetDeliveryChannel() {
+			delivered++
+			n.log.Info("delivered message: %s", string(msg.Payload))
+		}
+	}()
+}
+
+func (n *Node) getLeaderId() uuid.UUID {
+	n.rw.RLock()
+	defer n.rw.RUnlock()
+
+	for id, node := range n.replicationView.nodes {
+		if node.Info.IsLeader {
+			return id
+		}
+	}
+
+	return uuid.Nil
+}
+
+// a function that returns replication view members uuid.UUIDs
+func (n *Node) getReplicationGroupParticipants() []uuid.UUID {
+	n.rw.RLock()
+	defer n.rw.RUnlock()
+
+	multicastMembers := []uuid.UUID{}
+	for id, node := range n.replicationView.nodes {
+		if node.Info.GroupID == n.info.GroupID {
+			multicastMembers = append(multicastMembers, id)
+		}
+	}
+
+	return multicastMembers
+}
+
+func (n *Node) getLeaderAddr() *net.UDPAddr {
+	n.rw.RLock()
+	defer n.rw.RUnlock()
+
+	for _, node := range n.replicationView.nodes {
+		if node.Info.IsLeader {
+			return &net.UDPAddr{
+				IP:   node.Info.Host[:],
+				Port: int(node.Info.Port),
+			}
+		}
+	}
+
+	return nil
 }
 
 func (n *Node) startLeaderActivities() {
