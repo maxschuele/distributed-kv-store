@@ -296,9 +296,16 @@ func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 			return
 		}
 
+		n.clusterView.mu.Lock()
+		_, exists := n.clusterView.nodes[msg.Info.GroupID]
+		n.clusterView.mu.Unlock()
+
 		n.clusterView.AddOrUpdateNode(msg.Info)
-		n.consistent.AddNode(msg.Info.GroupID)
-		n.rebalanceKeys()
+		if !exists {
+			n.consistent.AddNode(msg.Info.GroupID)
+			n.rebalanceKeys()
+		}
+
 	case MessageTypeGroupJoin:
 		if !n.info.IsLeader {
 			return
@@ -588,6 +595,14 @@ func (n *Node) handleGetKey(w *httpserver.ResponseWriter, r *httpserver.Request)
 		return
 	}
 
+	// check whether the request of the client was made correctly
+	destinationID, err := n.consistent.GetNode(key)
+	if err != nil || (destinationID != n.info.GroupID) {
+		w.Status(404, "Not Found")
+		w.Write([]byte("Request was sent to wrong node"))
+		return
+	}
+
 	val, ok := n.storage.Get(key)
 	if !ok {
 		w.Status(404, "key not found")
@@ -606,6 +621,14 @@ func (n *Node) handlePutKey(w *httpserver.ResponseWriter, r *httpserver.Request)
 		return
 	}
 
+	// check whether the request of the client was made correctly
+	destinationID, err := n.consistent.GetNode(key)
+	if err != nil || (destinationID != n.info.GroupID) {
+		w.Status(404, "Not Found")
+		w.Write([]byte("Request was sent to wrong node"))
+		return
+	}
+
 	val := r.Body
 	n.storage.Set(key, r.Body)
 	n.writeNotifyMembers(key, val) // TODO: replace with multicast
@@ -619,6 +642,14 @@ func (n *Node) handleDeleteKey(w *httpserver.ResponseWriter, r *httpserver.Reque
 	if !ok || key == "" {
 		w.Status(400, "Bad Request")
 		w.Write([]byte("key parameter is required"))
+		return
+	}
+
+	// check whether the request of the client was made correctly
+	destinationID, err := n.consistent.GetNode(key)
+	if err != nil || (destinationID != n.info.GroupID) {
+		w.Status(404, "Not Found")
+		w.Write([]byte("Request was sent to wrong node"))
 		return
 	}
 
