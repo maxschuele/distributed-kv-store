@@ -13,7 +13,7 @@ import (
 
 type Client struct {
 	broadcastPort uint16
-	clusterView   *ClusterView
+	clusterView   *ClusterGroupView
 	consistent    *consistent.ConsistentHash
 	log           *logger.Logger
 	httpClient    *httpclient.Client

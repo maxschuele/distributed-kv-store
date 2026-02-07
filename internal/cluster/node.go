@@ -4,6 +4,7 @@ import (
 	"context"
 	"distributed-kv-store/internal/broadcast"
 	"distributed-kv-store/internal/consistent"
+	"distributed-kv-store/internal/httpclient"
 	"distributed-kv-store/internal/httpserver"
 	"distributed-kv-store/internal/logger"
 	"distributed-kv-store/internal/netutil"
@@ -36,10 +37,10 @@ type Node struct {
 	info            NodeInfo
 	log             *logger.Logger
 	httpServer      *httpserver.Server
-	clusterView     *ClusterView
-	replicationView *GroupView
+	clusterView     *ClusterGroupView
+	replicationView *ReplicationGroupView
 	clusterListener *net.TCPListener
-	connsistent     *consistent.ConsistentHash
+	consistent      *consistent.ConsistentHash
 	storage         *Storage
 	rw              sync.RWMutex
 	leaderAddr      string
@@ -131,7 +132,7 @@ func newBaseNode(cfg nodeConfig) (*Node, error) {
 		log:             log,
 		clusterView:     NewClusterView(log),
 		replicationView: NewGroupView(info.ID, log),
-		connsistent:     consistent.NewConsistentHash(150),
+		consistent:      consistent.NewConsistentHash(150),
 		storage:         NewStorage(),
 		broadcastPort:   broadcastPort,
 		groupPort:       cfg.groupPort,
@@ -170,7 +171,7 @@ func (n *Node) startActivities() {
 func (n *Node) startLeaderActivities() {
 	n.log.Info("Starting leader activities")
 
-	n.connsistent.AddNode(n.info.GroupID)
+	n.consistent.AddNode(n.info.GroupID)
 
 	go func() {
 		if err := broadcast.Listen(broadcastPort, n.log, n.handleBroadcastMessage); err != nil {
@@ -193,7 +194,7 @@ func (n *Node) handleReplicationGroupNodeRemoval(removedNode NodeInfo) {
 
 func (n *Node) handleClusterGroupNodeRemoval(removedNode NodeInfo) {
 	n.log.Info("Removing node %s from hashing ring", removedNode.GroupID.String())
-	n.connsistent.RemoveNode(removedNode.GroupID)
+	n.consistent.RemoveNode(removedNode.GroupID)
 }
 
 func (n *Node) listenClusterMessages() {
@@ -296,7 +297,8 @@ func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 		}
 
 		n.clusterView.AddOrUpdateNode(msg.Info)
-		n.connsistent.AddNode(msg.Info.GroupID)
+		n.consistent.AddNode(msg.Info.GroupID)
+		n.rebalanceKeys()
 	case MessageTypeGroupJoin:
 		if !n.info.IsLeader {
 			return
@@ -316,6 +318,46 @@ func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 			GroupPort:  n.groupPort,
 			HttpPort:   n.info.HttpPort,
 		})
+	}
+}
+
+func (n *Node) rebalanceKeys() {
+	n.storage.mu.Lock()
+	defer n.storage.mu.Unlock()
+
+	client := httpclient.NewClient()
+
+	for key, value := range n.storage.data {
+		groupId, err := n.consistent.GetNode(key)
+		if err != nil {
+			n.log.Error("failed to get node for key %q: %v", key, err)
+			continue
+		}
+
+		if groupId == n.info.GroupID {
+			continue
+		}
+
+		nodeInfo, err := n.clusterView.GetNode(groupId)
+		if err != nil {
+			n.log.Error("failed to find node for group %s: %v", groupId, err)
+			continue
+		}
+
+		addr := netutil.FormatAddress(nodeInfo.Host, nodeInfo.HttpPort)
+		resp, err := client.Put(addr, "/kv?key="+key, value)
+		if err != nil {
+			n.log.Error("failed to send key %q to %s: %v", key, addr, err)
+			continue
+		}
+
+		if resp.StatusCode != 200 {
+			n.log.Error("failed to send key %q to %s: status %d %s", key, addr, resp.StatusCode, resp.StatusText)
+			continue
+		}
+
+		delete(n.storage.data, key)
+		n.log.Info("rebalanced key %q to group %s", key, groupId)
 	}
 }
 
