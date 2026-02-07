@@ -162,6 +162,20 @@ func (n *Node) startActivities() {
 	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.InitiateElection)
 }
 
+func (n *Node) leaderMulticast(payload []byte) {
+	leaderId := n.info.ID
+	multicastMembers := n.getReplicationGroupParticipants()
+
+	rom := multicast.NewReliableFIFOMulticast(leaderId, leaderId, multicastMembers, n.log)
+	rom.Start()
+
+	go rom.InitializeUnicastListener(int(n.info.Port))
+	go rom.InitializeMulticastListenerOnPort(int(n.groupPort))
+	time.Sleep(100 * time.Millisecond)
+
+	rom.SendMulticast(payload) // TODO: call when notify members
+}
+
 // TODO: handle payload
 func (n *Node) multicastReceiveAndRetransmit() {
 	leaderId := n.getLeaderId()
