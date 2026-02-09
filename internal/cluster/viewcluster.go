@@ -2,7 +2,6 @@ package cluster
 
 import (
 	"distributed-kv-store/internal/logger"
-	"fmt"
 	"sync"
 	"time"
 
@@ -50,15 +49,15 @@ func (cv *ClusterGroupView) GetNodes() []NodeInfo {
 	return nodes
 }
 
-func (cv *ClusterGroupView) GetNode(groupID uuid.UUID) (NodeInfo, error) {
+func (cv *ClusterGroupView) GetNode(groupID uuid.UUID) (NodeInfo, bool) {
 	cv.mu.RLock()
 	defer cv.mu.RUnlock()
 
-	record, exists := cv.nodes[groupID]
-	if !exists {
-		return NodeInfo{}, fmt.Errorf("[ClusterView] No entry for group with UUID %s found", groupID.String())
+	if record, ok := cv.nodes[groupID]; ok {
+		return record.Info, ok
 	}
-	return record.Info, nil
+
+	return NodeInfo{}, false
 }
 
 func (cv *ClusterGroupView) RemoveStaleNodes(timeout time.Duration, handleNodeRemoval HandleNodeRemoval) {

@@ -20,6 +20,7 @@ import (
 const (
 	HeartbeatInterval        = 2 * time.Second
 	HeartbeatTimeout         = 8 * time.Second
+	RebalanceInterval        = 10 * time.Second
 	broadcastPort     uint16 = 9898
 )
 
@@ -182,6 +183,8 @@ func (n *Node) startLeaderActivities() {
 	go n.sendHeartbeats(broadcastPort)
 	go n.clusterView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.handleClusterGroupNodeRemoval)
 
+	go n.startPeriodicRebalance()
+
 	n.httpServer = httpserver.New()
 	go n.startHttpServer()
 }
@@ -296,10 +299,7 @@ func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 			return
 		}
 
-		n.clusterView.mu.Lock()
-		_, exists := n.clusterView.nodes[msg.Info.GroupID]
-		n.clusterView.mu.Unlock()
-
+		_, exists := n.clusterView.GetNode(msg.Info.GroupID)
 		n.clusterView.AddOrUpdateNode(msg.Info)
 		if !exists {
 			n.consistent.AddNode(msg.Info.GroupID)
@@ -325,46 +325,6 @@ func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 			GroupPort:  n.groupPort,
 			HttpPort:   n.info.HttpPort,
 		})
-	}
-}
-
-func (n *Node) rebalanceKeys() {
-	n.storage.mu.Lock()
-	defer n.storage.mu.Unlock()
-
-	client := httpclient.NewClient()
-
-	for key, value := range n.storage.data {
-		groupId, err := n.consistent.GetNode(key)
-		if err != nil {
-			n.log.Error("failed to get node for key %q: %v", key, err)
-			continue
-		}
-
-		if groupId == n.info.GroupID {
-			continue
-		}
-
-		nodeInfo, err := n.clusterView.GetNode(groupId)
-		if err != nil {
-			n.log.Error("failed to find node for group %s: %v", groupId, err)
-			continue
-		}
-
-		addr := netutil.FormatAddress(nodeInfo.Host, nodeInfo.HttpPort)
-		resp, err := client.Put(addr, "/kv?key="+key, value)
-		if err != nil {
-			n.log.Error("failed to send key %q to %s: %v", key, addr, err)
-			continue
-		}
-
-		if resp.StatusCode != 200 {
-			n.log.Error("failed to send key %q to %s: status %d %s", key, addr, resp.StatusCode, resp.StatusText)
-			continue
-		}
-
-		delete(n.storage.data, key)
-		n.log.Info("rebalanced key %q to group %s", key, groupId)
 	}
 }
 
@@ -395,6 +355,54 @@ func (n *Node) handleReplicationBroadcastMessage(buf []byte, remoteAddr *net.UDP
 		}
 
 		n.replicationView.AddOrUpdateNode(msg.Info)
+	}
+}
+
+func (n *Node) rebalanceKeys() {
+	n.storage.mu.Lock()
+	defer n.storage.mu.Unlock()
+
+	client := httpclient.NewClient()
+
+	for key, value := range n.storage.data {
+		groupId, err := n.consistent.GetNode(key)
+		if err != nil {
+			n.log.Error("failed to get node for key %q: %v", key, err)
+			continue
+		}
+
+		if groupId == n.info.GroupID {
+			continue
+		}
+
+		nodeInfo, ok := n.clusterView.GetNode(groupId)
+		if !ok {
+			n.log.Error("failed to find node for group %s: %v", groupId, err)
+			continue
+		}
+
+		addr := netutil.FormatAddress(nodeInfo.Host, nodeInfo.HttpPort)
+		resp, err := client.Put(addr, "/kv?key="+key, value)
+		if err != nil {
+			n.log.Error("failed to send key %q to %s: %v", key, addr, err)
+			continue
+		}
+
+		if resp.StatusCode != 200 {
+			n.log.Error("failed to send key %q to %s: status %d %s", key, addr, resp.StatusCode, resp.StatusText)
+			continue
+		}
+
+		delete(n.storage.data, key)
+		n.log.Info("rebalanced key %q to group %s", key, groupId)
+	}
+}
+
+func (n *Node) startPeriodicRebalance() {
+	ticker := time.NewTicker(RebalanceInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		n.rebalanceKeys()
 	}
 }
 
