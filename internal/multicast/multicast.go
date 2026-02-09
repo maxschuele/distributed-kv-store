@@ -3,19 +3,55 @@ package multicast
 import (
 	"bytes"
 	"context"
-	"distributed-kv-store/internal/logger"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"syscall"
 	"time"
 
+	"distributed-kv-store/internal/logger"
+
 	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
 )
 
-const multicastIP = "224.0.0.1"
+const multicastIP = "239.0.0.1"
+
+const (
+	fifoTag    = 0xA1
+	nakTag     = 0xA2
+	lastAckTag = 0xA3
+	summaryTag = 0xA4
+)
+
+const (
+	heartbeatInterval = 200 * time.Millisecond
+	nakMinInterval    = 150 * time.Millisecond
+)
+
+// --- fragmentation (inner payload protocol) ---
+const (
+	fragInnerTag byte = 0xF1
+	endInnerTag  byte = 0xF2
+
+	// Target max UDP datagram size for *our serialized FIFOMessage* (bytes).
+	// This is conservative and avoids IP fragmentation on common MTUs.
+	maxDatagramSize = 256
+
+	// FIFOMessage wire overhead:
+	// 1(tag) + 16(sender uuid) + 4(seq) + 4(payload len) + 8(timestamp) = 33 bytes
+	fifoWireOverhead = 1 + 16 + 4 + 4 + 8
+
+	// Fragment inner header:
+	// 1(innerTag) + 4(msgID) + 2(fragIndex) + 2(totalFrags) = 9 bytes
+	fragInnerOverhead = 1 + 4 + 2 + 2
+
+	// End inner header:
+	// 1(innerTag) + 4(msgID) + 2(totalFrags) + 4(totalLen) = 11 bytes
+	endInnerOverhead = 1 + 4 + 2 + 4
+)
 
 // FIFOMessage represents a FIFO multicast data message.
 type FIFOMessage struct {
@@ -39,6 +75,14 @@ type LastAckMessage struct {
 	Timestamp   time.Time
 }
 
+// SummaryMessage is a periodic leader heartbeat/summary indicating current Sp.
+// Receivers can detect "I'm behind" even if they missed *all* data messages.
+type SummaryMessage struct {
+	LeaderID  uuid.UUID
+	CurrentSp uint32
+	Timestamp time.Time
+}
+
 // ReliableFIFOMulticast provides reliable FIFO-ordered multicast (single-sender).
 type ReliableFIFOMulticast struct {
 	mu sync.RWMutex
@@ -51,6 +95,18 @@ type ReliableFIFOMulticast struct {
 	// sequence tracking (single sender)
 	Sp uint32 // send sequence (leader only)
 	Rq uint32 // last delivered (receiver only)
+
+	// application message id (leader only; increments once per original message)
+	appMsgID uint32
+
+	// reassembly state (receiver side)
+	fragActive     bool
+	fragMsgID      uint32
+	fragTotalFrags uint16
+	fragNextIndex  uint16
+	fragReceived   uint16
+	fragTotalLen   uint32
+	fragBuf        bytes.Buffer
 
 	// queues
 	holdback []*FIFOMessage
@@ -77,11 +133,20 @@ type ReliableFIFOMulticast struct {
 
 	// last-ack tracking (leader)
 	lastAck map[uuid.UUID]uint32
+
+	// heartbeat + NAK throttling
+	heartbeatOnce sync.Once
+	lastNAKSeq    uint32
+	lastNAKSentAt time.Time
+
+	summaryRelayOnce sync.Once
+	observedLeaderSp uint32
+	lastSummarySeen  time.Time
 }
 
 // NewReliableFIFOMulticast creates a FIFO-reliable multicast instance.
 // leaderID is the only sender in the group.
-func NewReliableFIFOMulticast(nodeID, leaderID uuid.UUID, participants []uuid.UUID, log *logger.Logger) *ReliableFIFOMulticast {
+func NewReliableFIFOMulticast(nodeID, leaderID uuid.UUID, participants []uuid.UUID, logger *logger.Logger) *ReliableFIFOMulticast {
 	rom := &ReliableFIFOMulticast{
 		nodeID:       nodeID,
 		leaderID:     leaderID,
@@ -91,7 +156,7 @@ func NewReliableFIFOMulticast(nodeID, leaderID uuid.UUID, participants []uuid.UU
 		sentMessages: make(map[uint32]*FIFOMessage),
 		addrMap:      make(map[uuid.UUID]*net.UDPAddr),
 		stopChan:     make(chan struct{}),
-		log:          log,
+		log:          logger,
 		lastAck:      make(map[uuid.UUID]uint32),
 	}
 	for _, id := range participants {
@@ -106,9 +171,9 @@ func NewReliableFIFOMulticastWithLeaderAddr(
 	nodeID, leaderID uuid.UUID,
 	participants []uuid.UUID,
 	leaderAddr *net.UDPAddr,
-	log *logger.Logger,
+	logger *logger.Logger,
 ) *ReliableFIFOMulticast {
-	rom := NewReliableFIFOMulticast(nodeID, leaderID, participants, log)
+	rom := NewReliableFIFOMulticast(nodeID, leaderID, participants, logger)
 	if leaderAddr != nil {
 		rom.addrMap[leaderID] = leaderAddr
 	}
@@ -125,11 +190,105 @@ func (rom *ReliableFIFOMulticast) Start() {
 	rom.isRunning = true
 	rom.Sp = 0
 	rom.Rq = 0
+	rom.appMsgID = 0
+
+	rom.fragActive = false
+	rom.fragMsgID = 0
+	rom.fragTotalFrags = 0
+	rom.fragNextIndex = 0
+	rom.fragReceived = 0
+	rom.fragTotalLen = 0
+	rom.fragBuf.Reset()
+
+	rom.observedLeaderSp = 0
+	rom.lastSummarySeen = time.Time{}
 	rom.mu.Unlock()
+
+	rom.startLeaderHeartbeat()
+	rom.startPeerSummaryRelay()
 
 	if rom.log != nil {
 		rom.log.Info("[FIFO] started for node %s (leader=%s)", rom.nodeID.String(), rom.leaderID.String())
 	}
+}
+
+func (rom *ReliableFIFOMulticast) startLeaderHeartbeat() {
+	rom.heartbeatOnce.Do(func() {
+		go func() {
+			t := time.NewTicker(heartbeatInterval)
+			defer t.Stop()
+
+			for {
+				select {
+				case <-rom.stopChan:
+					return
+				case <-t.C:
+					rom.mu.RLock()
+					if !rom.isRunning || rom.nodeID != rom.leaderID || rom.multicastSendConn == nil {
+						rom.mu.RUnlock()
+						continue
+					}
+					sp := rom.Sp
+					mc := rom.multicastSendConn
+					leaderID := rom.nodeID
+					rom.mu.RUnlock()
+
+					s := &SummaryMessage{
+						LeaderID:  leaderID,
+						CurrentSp: sp,
+						Timestamp: time.Now(),
+					}
+					data, err := MarshalSummaryMessage(s)
+					if err != nil {
+						continue
+					}
+					_, _ = mc.Write(data)
+				}
+			}
+		}()
+	})
+}
+
+func (rom *ReliableFIFOMulticast) startPeerSummaryRelay() {
+	rom.summaryRelayOnce.Do(func() {
+		go func() {
+			t := time.NewTicker(heartbeatInterval)
+			defer t.Stop()
+
+			for {
+				select {
+				case <-rom.stopChan:
+					return
+				case <-t.C:
+					rom.mu.RLock()
+					if !rom.isRunning || rom.nodeID == rom.leaderID || rom.multicastSendConn == nil {
+						rom.mu.RUnlock()
+						continue
+					}
+					// only relay if we've observed any leader progress at all
+					sp := rom.observedLeaderSp
+					if sp == 0 {
+						rom.mu.RUnlock()
+						continue
+					}
+					mc := rom.multicastSendConn
+					leaderID := rom.leaderID
+					rom.mu.RUnlock()
+
+					s := &SummaryMessage{
+						LeaderID:  leaderID,
+						CurrentSp: sp,
+						Timestamp: time.Now(),
+					}
+					data, err := MarshalSummaryMessage(s)
+					if err != nil {
+						continue
+					}
+					_, _ = mc.Write(data)
+				}
+			}
+		}()
+	})
 }
 
 // Stop terminates connections.
@@ -169,9 +328,6 @@ func (rom *ReliableFIFOMulticast) InitializeMulticastListener(groupIP string, po
 	if ip == nil || ip.To4() == nil {
 		return fmt.Errorf("invalid IPv4 multicast address: %q", groupIP)
 	}
-	if !isLocalMulticast(ip) {
-		return fmt.Errorf("multicast address must be in 224.0.0.0/24, got %s", ip.String())
-	}
 	if port <= 0 || port > 65535 {
 		return fmt.Errorf("invalid port: %d", port)
 	}
@@ -180,18 +336,14 @@ func (rom *ReliableFIFOMulticast) InitializeMulticastListener(groupIP string, po
 
 	lc := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
-			var opErr error
-			err := c.Control(func(fd uintptr) {
-				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-				if opErr != nil {
-					return
-				}
-				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-			})
-			if err != nil {
+			var innerErr error
+			if err := c.Control(func(fd uintptr) {
+				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+			}); err != nil {
 				return err
 			}
-			return opErr
+			return innerErr
 		},
 	}
 
@@ -214,7 +366,6 @@ func (rom *ReliableFIFOMulticast) InitializeMulticastListener(groupIP string, po
 	var joinErr error
 	if err := rc.Control(func(fd uintptr) {
 		multi := ip.To4()
-
 		mreq := &unix.IPMreqn{
 			Multiaddr: [4]byte{multi[0], multi[1], multi[2], multi[3]},
 		}
@@ -241,7 +392,10 @@ func (rom *ReliableFIFOMulticast) InitializeMulticastListener(groupIP string, po
 	rom.multicastSendConn = sendConn
 	rom.mu.Unlock()
 
-	// receive loop for multicast FIFO data messages
+	rom.startLeaderHeartbeat()
+	rom.startPeerSummaryRelay()
+
+	// receive loop for multicast FIFO data + NAK
 	go func(c *net.UDPConn) {
 		buf := make([]byte, 64*1024)
 		for {
@@ -263,18 +417,82 @@ func (rom *ReliableFIFOMulticast) InitializeMulticastListener(groupIP string, po
 				continue
 			}
 
-			if buf[0] != 0xA1 {
+			switch buf[0] {
+			case fifoTag:
+				msg, err := UnmarshalFIFOMessage(buf[:n])
+				if err != nil {
+					continue
+				}
+				_ = rom.ReceiveMulticast(msg)
+
+			case nakTag:
+				nak, err := UnmarshalNAKMessage(buf[:n])
+				if err != nil {
+					continue
+				}
+				rom.handleNAKMulticast(nak)
+
+			case summaryTag:
+				s, err := UnmarshalSummaryMessage(buf[:n])
+				if err != nil {
+					continue
+				}
+				rom.handleSummaryMulticast(s)
+
+			default:
 				continue
 			}
-			msg, err := UnmarshalFIFOMessage(buf[:n])
-			if err != nil {
-				continue
-			}
-			_ = rom.ReceiveMulticast(msg)
 		}
 	}(conn)
 
 	return nil
+}
+
+func (rom *ReliableFIFOMulticast) handleSummaryMulticast(s *SummaryMessage) {
+	rom.mu.Lock()
+	if !rom.isRunning {
+		rom.mu.Unlock()
+		return
+	}
+
+	// accept summaries from leader OR peers, but only for our leader stream
+	if s.LeaderID != rom.leaderID {
+		rom.mu.Unlock()
+		return
+	}
+
+	// track highest observed leader progress (used for peer relay + "silent joiner" detection)
+	if s.CurrentSp > rom.observedLeaderSp {
+		rom.observedLeaderSp = s.CurrentSp
+	}
+	rom.lastSummarySeen = time.Now()
+
+	// leader doesn't need to NAK itself
+	if rom.nodeID == rom.leaderID {
+		rom.mu.Unlock()
+		return
+	}
+
+	// If leader has advanced beyond what we've delivered, we know we're missing something.
+	if s.CurrentSp <= rom.Rq {
+		rom.mu.Unlock()
+		return
+	}
+
+	expected := rom.Rq + 1
+	// simple throttle to avoid NAKing every heartbeat tick
+	if expected == rom.lastNAKSeq && time.Since(rom.lastNAKSentAt) < nakMinInterval {
+		rom.mu.Unlock()
+		return
+	}
+	rom.mu.Unlock()
+
+	nak := &NAKMessage{
+		RequesterID: rom.nodeID,
+		MissingSeq:  expected,
+		Timestamp:   time.Now(),
+	}
+	rom.sendNAK(nak)
 }
 
 // InitializeMulticastListenerOnPort hardcodes the multicast group to 224.0.0.1
@@ -358,8 +576,8 @@ func (rom *ReliableFIFOMulticast) InitializeUnicastListener(listenPort int) erro
 	return nil
 }
 
-// SendMulticast creates a FIFO message, increments Sp, stores it for retransmission,
-// and sends it via IP multicast. Only the leader may call this.
+// SendMulticast fragments payload into <=512-byte datagrams (serialized FIFOMessage size),
+// sends each fragment as a FIFO packet, then sends an END marker. Only the leader may call this.
 func (rom *ReliableFIFOMulticast) SendMulticast(payload []byte) (*FIFOMessage, error) {
 	rom.mu.Lock()
 	if !rom.isRunning {
@@ -375,25 +593,187 @@ func (rom *ReliableFIFOMulticast) SendMulticast(payload []byte) (*FIFOMessage, e
 		return nil, fmt.Errorf("multicast not initialized")
 	}
 
+	rom.appMsgID++
+	appID := rom.appMsgID
+	mc := rom.multicastSendConn
+
+	maxData := maxFragmentDataBytes()
+
+	// Build transport packets under lock (updates Sp + sentMessages consistently)
+	packets := make([]*FIFOMessage, 0, 4)
+
+	now := time.Now()
+	if len(payload) == 0 {
+		// No fragments, just END
+		rom.Sp++
+		endMsg := &FIFOMessage{
+			SenderID:  rom.nodeID,
+			Seq:       rom.Sp,
+			Payload:   makeEndPayload(appID, 0, 0),
+			Timestamp: now,
+		}
+		rom.sentMessages[endMsg.Seq] = endMsg
+		packets = append(packets, endMsg)
+		rom.mu.Unlock()
+		// send
+		data, err := MarshalFIFOMessage(endMsg)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := mc.Write(data); err != nil {
+			return nil, err
+		}
+		return endMsg, nil
+	}
+
+	totalFrags := uint16((len(payload) + maxData - 1) / maxData)
+	var fragIndex uint16 = 0
+
+	for off := 0; off < len(payload); off += maxData {
+		end := off + maxData
+		if end > len(payload) {
+			end = len(payload)
+		}
+		chunk := payload[off:end]
+
+		rom.Sp++
+		msg := &FIFOMessage{
+			SenderID:  rom.nodeID,
+			Seq:       rom.Sp,
+			Payload:   makeFragPayload(appID, fragIndex, totalFrags, chunk),
+			Timestamp: time.Now(),
+		}
+		rom.sentMessages[msg.Seq] = msg
+		packets = append(packets, msg)
+
+		fragIndex++
+	}
+
 	rom.Sp++
-	msg := &FIFOMessage{
+	endMsg := &FIFOMessage{
 		SenderID:  rom.nodeID,
 		Seq:       rom.Sp,
-		Payload:   payload,
+		Payload:   makeEndPayload(appID, totalFrags, uint32(len(payload))),
 		Timestamp: time.Now(),
 	}
-	rom.sentMessages[msg.Seq] = msg
-	mc := rom.multicastSendConn
+	rom.sentMessages[endMsg.Seq] = endMsg
+	packets = append(packets, endMsg)
+
 	rom.mu.Unlock()
 
-	data, err := MarshalFIFOMessage(msg)
-	if err != nil {
-		return nil, err
+	// Send outside lock
+	for _, p := range packets {
+		data, err := MarshalFIFOMessage(p)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := mc.Write(data); err != nil {
+			return nil, err
+		}
 	}
-	if _, err := mc.Write(data); err != nil {
-		return nil, err
+
+	return endMsg, nil
+}
+
+func (rom *ReliableFIFOMulticast) resetReassemblyUnlocked() {
+	rom.fragActive = false
+	rom.fragMsgID = 0
+	rom.fragTotalFrags = 0
+	rom.fragNextIndex = 0
+	rom.fragReceived = 0
+	rom.fragTotalLen = 0
+	rom.fragBuf.Reset()
+}
+
+// processTransportDeliveriesUnlocked converts in-order transport packets into
+// application deliveries by reassembling fragment streams.
+func (rom *ReliableFIFOMulticast) processTransportDeliveriesUnlocked(deliverList []*FIFOMessage) []*FIFOMessage {
+	out := make([]*FIFOMessage, 0, len(deliverList))
+	for _, tm := range deliverList {
+		if len(tm.Payload) == 0 {
+			out = append(out, tm)
+			continue
+		}
+
+		switch tm.Payload[0] {
+		case fragInnerTag:
+			msgID, idx, total, data, ok := parseFragPayload(tm.Payload)
+			if !ok {
+				// treat as opaque
+				out = append(out, tm)
+				continue
+			}
+
+			// Start or validate stream
+			if !rom.fragActive {
+				rom.fragActive = true
+				rom.fragMsgID = msgID
+				rom.fragTotalFrags = total
+				rom.fragNextIndex = 0
+				rom.fragReceived = 0
+				rom.fragTotalLen = 0
+				rom.fragBuf.Reset()
+			}
+
+			// If sender changes stream unexpectedly, reset (protocol violation / corruption)
+			if msgID != rom.fragMsgID || total != rom.fragTotalFrags || idx != rom.fragNextIndex {
+				rom.resetReassemblyUnlocked()
+				// drop this packet at app layer (transport reliability still continues)
+				continue
+			}
+
+			_, _ = rom.fragBuf.Write(data)
+			rom.fragNextIndex++
+			rom.fragReceived++
+			continue
+
+		case endInnerTag:
+			msgID, total, totalLen, ok := parseEndPayload(tm.Payload)
+			if !ok {
+				out = append(out, tm)
+				continue
+			}
+
+			// Empty message: END with totalFrags=0
+			if total == 0 {
+				rom.resetReassemblyUnlocked()
+				out = append(out, &FIFOMessage{
+					SenderID:  tm.SenderID,
+					Seq:       tm.Seq,
+					Payload:   nil,
+					Timestamp: tm.Timestamp,
+				})
+				continue
+			}
+
+			// Normal completion
+			if rom.fragActive &&
+				msgID == rom.fragMsgID &&
+				total == rom.fragTotalFrags &&
+				rom.fragReceived == total &&
+				uint32(rom.fragBuf.Len()) == totalLen {
+
+				assembled := make([]byte, rom.fragBuf.Len())
+				copy(assembled, rom.fragBuf.Bytes())
+
+				out = append(out, &FIFOMessage{
+					SenderID:  tm.SenderID,
+					Seq:       tm.Seq, // END transport seq
+					Payload:   assembled,
+					Timestamp: tm.Timestamp,
+				})
+			}
+
+			rom.resetReassemblyUnlocked()
+			continue
+
+		default:
+			// legacy/unfragmented delivery
+			out = append(out, tm)
+			continue
+		}
 	}
-	return msg, nil
+	return out
 }
 
 // ReceiveMulticast handles FIFO ordering, buffering, and NAKs.
@@ -409,6 +789,13 @@ func (rom *ReliableFIFOMulticast) ReceiveMulticast(msg *FIFOMessage) error {
 		rom.mu.Unlock()
 		return nil
 	}
+
+	if msg.Seq > rom.observedLeaderSp {
+		rom.observedLeaderSp = msg.Seq
+	}
+
+	// cache received messages too (so receivers can repair if leader dies)
+	rom.sentMessages[msg.Seq] = msg
 
 	// drop duplicates
 	if msg.Seq <= rom.Rq {
@@ -438,10 +825,26 @@ func (rom *ReliableFIFOMulticast) ReceiveMulticast(msg *FIFOMessage) error {
 		rom.addToHoldbackUnlocked(msg)
 	}
 
+	shouldLastAck := false
+	if rom.nodeID != rom.leaderID {
+		for _, tm := range deliverList {
+			if len(tm.Payload) > 0 && tm.Payload[0] == endInnerTag {
+				shouldLastAck = true
+				break
+			}
+		}
+	}
+
+	appDeliveries := rom.processTransportDeliveriesUnlocked(deliverList)
+
 	rom.mu.Unlock()
 
-	for _, m := range deliverList {
+	for _, m := range appDeliveries {
 		rom.delivery <- m
+	}
+
+	if shouldLastAck {
+		_ = rom.SendLastAck()
 	}
 
 	return nil
@@ -613,39 +1016,55 @@ func (rom *ReliableFIFOMulticast) deliverFromHoldbackUnlocked() []*FIFOMessage {
 }
 
 func (rom *ReliableFIFOMulticast) sendNAK(nak *NAKMessage) {
-	rom.mu.RLock()
-	addr := rom.addrMap[rom.leaderID]
-	uconn := rom.unicastConn
-	rom.mu.RUnlock()
-
-	if addr == nil {
+	rom.mu.Lock()
+	mc := rom.multicastSendConn
+	if mc == nil {
+		rom.mu.Unlock()
 		return
 	}
+	rom.lastNAKSeq = nak.MissingSeq
+	rom.lastNAKSentAt = time.Now()
+	rom.mu.Unlock()
+
 	data, err := MarshalNAKMessage(nak)
 	if err != nil {
 		return
 	}
-	if uconn != nil {
-		_, _ = uconn.WriteToUDP(data, addr)
+	_, _ = mc.Write(data)
+}
+
+func (rom *ReliableFIFOMulticast) handleNAKMulticast(nak *NAKMessage) {
+	rom.mu.RLock()
+	if !rom.isRunning {
+		rom.mu.RUnlock()
 		return
 	}
-	conn, err := net.DialUDP("udp", nil, addr)
+	// don't bother responding to our own NAK
+	if nak.RequesterID == rom.nodeID {
+		rom.mu.RUnlock()
+		return
+	}
+
+	// if we have the missing message, re-multicast it
+	msg := rom.sentMessages[nak.MissingSeq]
+	mc := rom.multicastSendConn
+	rom.mu.RUnlock()
+
+	if msg == nil || mc == nil {
+		return
+	}
+
+	data, err := MarshalFIFOMessage(msg)
 	if err != nil {
 		return
 	}
-	_, _ = conn.Write(data)
-	_ = conn.Close()
-}
-
-func isLocalMulticast(ip net.IP) bool {
-	ip4 := ip.To4()
-	return ip4 != nil && ip4[0] == 224 && ip4[1] == 0 && ip4[2] == 0
+	_, _ = mc.Write(data)
 }
 
 // MarshalFIFOMessage serializes a FIFOMessage. First byte is a type tag (0xA1).
 func MarshalFIFOMessage(msg *FIFOMessage) ([]byte, error) {
 	buf := &bytes.Buffer{}
-	_ = buf.WriteByte(0xA1)
+	_ = buf.WriteByte(fifoTag)
 	if _, err := buf.Write(msg.SenderID[:]); err != nil {
 		return nil, err
 	}
@@ -671,11 +1090,11 @@ func UnmarshalFIFOMessage(data []byte) (*FIFOMessage, error) {
 	if err := binary.Read(buf, binary.BigEndian, &tag); err != nil {
 		return nil, err
 	}
-	if tag != 0xA1 {
+	if tag != fifoTag {
 		return nil, fmt.Errorf("unexpected message type: %d", tag)
 	}
 	var idBytes [16]byte
-	if _, err := buf.Read(idBytes[:]); err != nil {
+	if _, err := io.ReadFull(buf, idBytes[:]); err != nil {
 		return nil, err
 	}
 	var seq uint32
@@ -687,7 +1106,7 @@ func UnmarshalFIFOMessage(data []byte) (*FIFOMessage, error) {
 		return nil, err
 	}
 	payload := make([]byte, payloadLen)
-	if _, err := buf.Read(payload); err != nil {
+	if _, err := io.ReadFull(buf, payload); err != nil {
 		return nil, err
 	}
 	var ts int64
@@ -706,7 +1125,7 @@ func UnmarshalFIFOMessage(data []byte) (*FIFOMessage, error) {
 // MarshalNAKMessage serializes a NAKMessage. First byte is a type tag (0xA2).
 func MarshalNAKMessage(msg *NAKMessage) ([]byte, error) {
 	buf := &bytes.Buffer{}
-	_ = buf.WriteByte(0xA2)
+	_ = buf.WriteByte(nakTag)
 	if _, err := buf.Write(msg.RequesterID[:]); err != nil {
 		return nil, err
 	}
@@ -726,11 +1145,11 @@ func UnmarshalNAKMessage(data []byte) (*NAKMessage, error) {
 	if err := binary.Read(buf, binary.BigEndian, &tag); err != nil {
 		return nil, err
 	}
-	if tag != 0xA2 {
+	if tag != nakTag {
 		return nil, fmt.Errorf("unexpected message type: %d", tag)
 	}
 	var reqBytes [16]byte
-	if _, err := buf.Read(reqBytes[:]); err != nil {
+	if _, err := io.ReadFull(buf, reqBytes[:]); err != nil {
 		return nil, err
 	}
 	var missing uint32
@@ -749,10 +1168,56 @@ func UnmarshalNAKMessage(data []byte) (*NAKMessage, error) {
 	}, nil
 }
 
+// MarshalSummaryMessage serializes a SummaryMessage. First byte is a type tag (0xA4).
+func MarshalSummaryMessage(msg *SummaryMessage) ([]byte, error) {
+	buf := &bytes.Buffer{}
+	_ = buf.WriteByte(summaryTag)
+	if _, err := buf.Write(msg.LeaderID[:]); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.BigEndian, msg.CurrentSp); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.BigEndian, msg.Timestamp.UnixNano()); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// UnmarshalSummaryMessage deserializes a SummaryMessage.
+func UnmarshalSummaryMessage(data []byte) (*SummaryMessage, error) {
+	buf := bytes.NewReader(data)
+	var tag byte
+	if err := binary.Read(buf, binary.BigEndian, &tag); err != nil {
+		return nil, err
+	}
+	if tag != summaryTag {
+		return nil, fmt.Errorf("unexpected message type: %d", tag)
+	}
+	var leaderBytes [16]byte
+	if _, err := io.ReadFull(buf, leaderBytes[:]); err != nil {
+		return nil, err
+	}
+	var sp uint32
+	if err := binary.Read(buf, binary.BigEndian, &sp); err != nil {
+		return nil, err
+	}
+	var ts int64
+	if err := binary.Read(buf, binary.BigEndian, &ts); err != nil {
+		return nil, err
+	}
+
+	return &SummaryMessage{
+		LeaderID:  uuid.UUID(leaderBytes),
+		CurrentSp: sp,
+		Timestamp: time.Unix(0, ts),
+	}, nil
+}
+
 // MarshalLastAckMessage serializes a LastAckMessage. First byte is a type tag (0xA3).
 func MarshalLastAckMessage(msg *LastAckMessage) ([]byte, error) {
 	buf := &bytes.Buffer{}
-	_ = buf.WriteByte(0xA3)
+	_ = buf.WriteByte(lastAckTag)
 	if _, err := buf.Write(msg.RequesterID[:]); err != nil {
 		return nil, err
 	}
@@ -772,11 +1237,11 @@ func UnmarshalLastAckMessage(data []byte) (*LastAckMessage, error) {
 	if err := binary.Read(buf, binary.BigEndian, &tag); err != nil {
 		return nil, err
 	}
-	if tag != 0xA3 {
+	if tag != lastAckTag {
 		return nil, fmt.Errorf("unexpected message type: %d", tag)
 	}
 	var reqBytes [16]byte
-	if _, err := buf.Read(reqBytes[:]); err != nil {
+	if _, err := io.ReadFull(buf, reqBytes[:]); err != nil {
 		return nil, err
 	}
 	var last uint32
@@ -793,4 +1258,69 @@ func UnmarshalLastAckMessage(data []byte) (*LastAckMessage, error) {
 		LastSeq:     last,
 		Timestamp:   time.Unix(0, ts),
 	}, nil
+}
+
+func maxFragmentDataBytes() int {
+	// Ensure each serialized FIFOMessage stays <= maxDatagramSize
+	maxPayload := maxDatagramSize - fifoWireOverhead
+	maxData := maxPayload - fragInnerOverhead
+	if maxData < 1 {
+		return 1
+	}
+	return maxData
+}
+
+func makeFragPayload(msgID uint32, fragIndex, totalFrags uint16, data []byte) []byte {
+	p := make([]byte, 0, fragInnerOverhead+len(data))
+	p = append(p, fragInnerTag)
+	var b4 [4]byte
+	binary.BigEndian.PutUint32(b4[:], msgID)
+	p = append(p, b4[:]...)
+
+	var b2 [2]byte
+	binary.BigEndian.PutUint16(b2[:], fragIndex)
+	p = append(p, b2[:]...)
+	binary.BigEndian.PutUint16(b2[:], totalFrags)
+	p = append(p, b2[:]...)
+
+	p = append(p, data...)
+	return p
+}
+
+func makeEndPayload(msgID uint32, totalFrags uint16, totalLen uint32) []byte {
+	p := make([]byte, 0, endInnerOverhead)
+	p = append(p, endInnerTag)
+
+	var b4 [4]byte
+	binary.BigEndian.PutUint32(b4[:], msgID)
+	p = append(p, b4[:]...)
+
+	var b2 [2]byte
+	binary.BigEndian.PutUint16(b2[:], totalFrags)
+	p = append(p, b2[:]...)
+
+	binary.BigEndian.PutUint32(b4[:], totalLen)
+	p = append(p, b4[:]...)
+	return p
+}
+
+func parseFragPayload(payload []byte) (msgID uint32, fragIndex, totalFrags uint16, data []byte, ok bool) {
+	if len(payload) < fragInnerOverhead || payload[0] != fragInnerTag {
+		return 0, 0, 0, nil, false
+	}
+	msgID = binary.BigEndian.Uint32(payload[1:5])
+	fragIndex = binary.BigEndian.Uint16(payload[5:7])
+	totalFrags = binary.BigEndian.Uint16(payload[7:9])
+	data = payload[9:]
+	return msgID, fragIndex, totalFrags, data, true
+}
+
+func parseEndPayload(payload []byte) (msgID uint32, totalFrags uint16, totalLen uint32, ok bool) {
+	if len(payload) < endInnerOverhead || payload[0] != endInnerTag {
+		return 0, 0, 0, false
+	}
+	msgID = binary.BigEndian.Uint32(payload[1:5])
+	totalFrags = binary.BigEndian.Uint16(payload[5:7])
+	totalLen = binary.BigEndian.Uint32(payload[7:11])
+	return msgID, totalFrags, totalLen, true
 }

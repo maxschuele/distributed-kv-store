@@ -28,6 +28,8 @@ func (n *Node) initiateElection() {
 	n.info.Participant = true
 	n.rw.Unlock()
 
+	// if after a timeout leader is not elected restart election
+	go n.restartElectionAfterTimeOut()
 	n.log.Info("[Election] Initiating election")
 
 	n.forwardElectionMessage(&ElectionMessage{
@@ -38,7 +40,7 @@ func (n *Node) initiateElection() {
 
 func (n *Node) handleElectionMessage(msg *ElectionMessage) {
 	n.rw.Lock()
-	defer n.rw.Unlock()
+	//defer n.rw.Unlock()
 
 	// Leader Announcement
 	if msg.IsLeader {
@@ -50,13 +52,19 @@ func (n *Node) handleElectionMessage(msg *ElectionMessage) {
 			leaderNode, err := n.replicationView.GetNode(msg.CandidateID)
 
 			if err != nil {
-				//TODO
+				// if new leader died after announcement restart election
+				n.log.Warn("[Election] Received message for dead/unknown leader %s. Dropping and restarting.", msg.CandidateID)
+				n.info.Participant = false
+				n.rw.Unlock()
+				n.InitiateElection()
+				return
 			}
-
 			n.leaderAddr = netutil.FormatAddress(leaderNode.Host, leaderNode.Port)
-			go n.forwardElectionMessage(msg)
+			n.rw.Unlock()
+			n.forwardElectionMessage(msg)
 		} else {
 			n.leaderAddr = netutil.FormatAddress(n.info.Host, n.info.Port)
+			n.rw.Unlock()
 		}
 		return
 	}
@@ -64,18 +72,39 @@ func (n *Node) handleElectionMessage(msg *ElectionMessage) {
 	// Case 2: Voting Phase
 	cmp := bytes.Compare(n.info.ID[:], msg.CandidateID[:])
 
+	if msg.CandidateID != n.info.ID {
+		// check first if this node still lives
+		_, err := n.replicationView.GetNode(msg.CandidateID)
+		// if no, initiate new election
+		if err != nil {
+			n.log.Warn("[Election] Received message for dead/unknown candidate %s. Dropping and restarting.", msg.CandidateID)
+			n.info.Participant = false
+			n.rw.Unlock()
+			n.InitiateElection()
+			return
+		}
+	}
+
 	if cmp > 0 {
 		// My ID is higher than the candidate's, send my ID.
 		if !n.info.Participant {
 			n.log.Info("[Election] Received lower ID (%s). Starting my own election.", msg.CandidateID)
 			n.info.Participant = true
+			n.rw.Unlock()
 			go n.forwardElectionMessage(&ElectionMessage{CandidateID: n.info.ID, IsLeader: false})
+			// if after a timeout leader is not elected restart election
+			go n.restartElectionAfterTimeOut()
+		} else {
+			n.rw.Unlock()
 		}
 	} else if cmp < 0 {
 		// My ID is lower. I accept this candidate and forward the message.
 		n.log.Info("[Election] Received higher ID (%s). Forwarding.", msg.CandidateID)
 		n.info.Participant = true
+		n.rw.Unlock()
 		go n.forwardElectionMessage(msg)
+		// if after a timeout leader is not elected restart election
+		go n.restartElectionAfterTimeOut()
 	} else {
 		// IDs match. The message circled back to me. I won!
 		n.log.Info("[Election] I have won the election!")
@@ -87,6 +116,7 @@ func (n *Node) handleElectionMessage(msg *ElectionMessage) {
 			CandidateID: n.info.ID,
 			IsLeader:    true,
 		}
+		n.rw.Unlock()
 		go n.forwardElectionMessage(announceMsg)
 
 		// start activites as new leader
@@ -137,4 +167,20 @@ func (n *Node) hasExistingLeader() bool {
 		}
 	}
 	return false
+}
+
+func (n *Node) restartElectionAfterTimeOut() {
+	for {
+		// if election took to long restart it
+		time.Sleep(2 * HeartbeatTimeout)
+		n.rw.Lock()
+		if n.info.Participant {
+			n.info.Participant = false
+			n.rw.Unlock()
+			n.InitiateElection()
+			return
+		}
+		n.rw.Unlock()
+	}
+
 }
