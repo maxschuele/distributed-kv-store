@@ -3,6 +3,8 @@ package cluster
 import (
 	"context"
 	"distributed-kv-store/internal/broadcast"
+	"distributed-kv-store/internal/consistent"
+	"distributed-kv-store/internal/httpclient"
 	"distributed-kv-store/internal/httpserver"
 	"distributed-kv-store/internal/logger"
 	"distributed-kv-store/internal/multicast"
@@ -19,6 +21,7 @@ import (
 const (
 	HeartbeatInterval        = 2 * time.Second
 	HeartbeatTimeout         = 8 * time.Second
+	RebalanceInterval        = 10 * time.Second
 	broadcastPort     uint16 = 9898
 )
 
@@ -36,9 +39,10 @@ type Node struct {
 	info            NodeInfo
 	log             *logger.Logger
 	httpServer      *httpserver.Server
-	clusterView     *GroupView
-	replicationView *GroupView
+	clusterView     *ClusterGroupView
+	replicationView *ReplicationGroupView
 	clusterListener *net.TCPListener
+	consistent      *consistent.ConsistentHash
 	storage         *Storage
 	rw              sync.RWMutex
 	leaderAddr      string
@@ -77,7 +81,9 @@ func StartNode(ip string, clusterPort uint16, httpPort uint16, groupPort uint16,
 		logger.New(logger.DEBUG).Fatal("%v", err)
 	}
 
-	n.log.Info("starting node %s", n.info.ID.String())
+	n.info.GroupID = uuid.New()
+
+	n.log.Info("starting node groupID: %s ID: %s", n.info.GroupID.String(), n.info.ID.String())
 	n.startActivities()
 	n.startLeaderActivities()
 }
@@ -126,15 +132,17 @@ func newBaseNode(cfg nodeConfig) (*Node, error) {
 	n := &Node{
 		info:            info,
 		log:             log,
-		clusterView:     NewGroupView(info.ID, log, ClusterGroupViewType),
-		replicationView: NewGroupView(info.ID, log, ReplicationGroupViewType),
+		clusterView:     NewClusterView(log),
+		replicationView: NewGroupView(info.ID, log),
+		consistent:      consistent.NewConsistentHash(150),
 		storage:         NewStorage(),
 		broadcastPort:   broadcastPort,
 		groupPort:       cfg.groupPort,
 		iface:           iface,
 	}
 
-	// TODO: add self to clusterView and replicationView
+	// add self to replication view (needed for election)
+	n.replicationView.AddOrUpdateNode(info)
 
 	clusterTcpAddr, err := netutil.ParseTcp4Addr(ip, cfg.clusterPort)
 	if err != nil {
@@ -159,7 +167,7 @@ func (n *Node) startActivities() {
 	}()
 
 	go n.sendHeartbeats(n.groupPort)
-	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.InitiateElection)
+	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.handleReplicationGroupNodeRemoval)
 }
 
 func (n *Node) leaderMulticast(payload []byte) {
@@ -244,6 +252,9 @@ func (n *Node) getLeaderAddr() *net.UDPAddr {
 
 func (n *Node) startLeaderActivities() {
 	n.log.Info("Starting leader activities")
+
+	n.consistent.AddNode(n.info.GroupID)
+
 	go func() {
 		if err := broadcast.Listen(broadcastPort, n.log, n.handleBroadcastMessage); err != nil {
 			n.log.Fatal("Error listening to broadcast: %v", err)
@@ -251,10 +262,23 @@ func (n *Node) startLeaderActivities() {
 	}()
 
 	go n.sendHeartbeats(broadcastPort)
-	go n.clusterView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, func() {})
+	go n.clusterView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.handleClusterGroupNodeRemoval)
+
+	go n.startPeriodicRebalance()
 
 	n.httpServer = httpserver.New()
 	go n.startHttpServer()
+}
+
+func (n *Node) handleReplicationGroupNodeRemoval(removedNode NodeInfo) {
+	if removedNode.IsLeader {
+		n.initiateElection()
+	}
+}
+
+func (n *Node) handleClusterGroupNodeRemoval(removedNode NodeInfo) {
+	n.log.Info("Removing node %s from hashing ring", removedNode.GroupID.String())
+	n.consistent.RemoveNode(removedNode.GroupID)
 }
 
 func (n *Node) listenClusterMessages() {
@@ -356,7 +380,13 @@ func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 			return
 		}
 
+		_, exists := n.clusterView.GetNode(msg.Info.GroupID)
 		n.clusterView.AddOrUpdateNode(msg.Info)
+		if !exists {
+			n.consistent.AddNode(msg.Info.GroupID)
+			n.rebalanceKeys()
+		}
+
 	case MessageTypeGroupJoin:
 		if !n.info.IsLeader {
 			return
@@ -391,10 +421,9 @@ func (n *Node) handleReplicationBroadcastMessage(buf []byte, remoteAddr *net.UDP
 		return
 	}
 
-	// do not ignore own
-	// if header.ID == n.info.ID {
-	// 	return
-	// }
+	if header.ID == n.info.ID {
+		return
+	}
 
 	payload := buf[header.SizeBytes():]
 
@@ -407,6 +436,54 @@ func (n *Node) handleReplicationBroadcastMessage(buf []byte, remoteAddr *net.UDP
 		}
 
 		n.replicationView.AddOrUpdateNode(msg.Info)
+	}
+}
+
+func (n *Node) rebalanceKeys() {
+	n.storage.mu.Lock()
+	defer n.storage.mu.Unlock()
+
+	client := httpclient.NewClient()
+
+	for key, value := range n.storage.data {
+		groupId, err := n.consistent.GetNode(key)
+		if err != nil {
+			n.log.Error("failed to get node for key %q: %v", key, err)
+			continue
+		}
+
+		if groupId == n.info.GroupID {
+			continue
+		}
+
+		nodeInfo, ok := n.clusterView.GetNode(groupId)
+		if !ok {
+			n.log.Error("failed to find node for group %s: %v", groupId, err)
+			continue
+		}
+
+		addr := netutil.FormatAddress(nodeInfo.Host, nodeInfo.HttpPort)
+		resp, err := client.Put(addr, "/kv?key="+key, value)
+		if err != nil {
+			n.log.Error("failed to send key %q to %s: %v", key, addr, err)
+			continue
+		}
+
+		if resp.StatusCode != 200 {
+			n.log.Error("failed to send key %q to %s: status %d %s", key, addr, resp.StatusCode, resp.StatusText)
+			continue
+		}
+
+		delete(n.storage.data, key)
+		n.log.Info("rebalanced key %q to group %s", key, groupId)
+	}
+}
+
+func (n *Node) startPeriodicRebalance() {
+	ticker := time.NewTicker(RebalanceInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		n.rebalanceKeys()
 	}
 }
 
@@ -607,6 +684,14 @@ func (n *Node) handleGetKey(w *httpserver.ResponseWriter, r *httpserver.Request)
 		return
 	}
 
+	// check whether the request of the client was made correctly
+	destinationID, err := n.consistent.GetNode(key)
+	if err != nil || (destinationID != n.info.GroupID) {
+		w.Status(404, "Not Found")
+		w.Write([]byte("Request was sent to wrong node"))
+		return
+	}
+
 	val, ok := n.storage.Get(key)
 	if !ok {
 		w.Status(404, "key not found")
@@ -625,6 +710,14 @@ func (n *Node) handlePutKey(w *httpserver.ResponseWriter, r *httpserver.Request)
 		return
 	}
 
+	// check whether the request of the client was made correctly
+	destinationID, err := n.consistent.GetNode(key)
+	if err != nil || (destinationID != n.info.GroupID) {
+		w.Status(404, "Not Found")
+		w.Write([]byte("Request was sent to wrong node"))
+		return
+	}
+
 	val := r.Body
 	n.storage.Set(key, r.Body)
 	n.writeNotifyMembers(key, val) // TODO: replace with multicast
@@ -638,6 +731,14 @@ func (n *Node) handleDeleteKey(w *httpserver.ResponseWriter, r *httpserver.Reque
 	if !ok || key == "" {
 		w.Status(400, "Bad Request")
 		w.Write([]byte("key parameter is required"))
+		return
+	}
+
+	// check whether the request of the client was made correctly
+	destinationID, err := n.consistent.GetNode(key)
+	if err != nil || (destinationID != n.info.GroupID) {
+		w.Status(404, "Not Found")
+		w.Write([]byte("Request was sent to wrong node"))
 		return
 	}
 
