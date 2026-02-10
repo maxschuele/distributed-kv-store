@@ -25,6 +25,16 @@ func (n *Node) initiateElection() {
 		return
 	}
 
+	// if only node in group, self-elect as leader immediately
+	if n.replicationView.Size() <= 1 {
+		n.info.IsLeader = true
+		n.info.Participant = false
+		n.rw.Unlock()
+		n.log.Info("[Election] Only node in group, self-electing as leader")
+		n.startLeaderActivities()
+		return
+	}
+
 	n.info.Participant = true
 	n.rw.Unlock()
 
@@ -56,7 +66,7 @@ func (n *Node) handleElectionMessage(msg *ElectionMessage) {
 				n.log.Warn("[Election] Received message for dead/unknown leader %s. Dropping and restarting.", msg.CandidateID)
 				n.info.Participant = false
 				n.rw.Unlock()
-				n.InitiateElection()
+				n.initiateElection()
 				return
 			}
 			n.leaderAddr = netutil.FormatAddress(leaderNode.Host, leaderNode.Port)
@@ -80,7 +90,7 @@ func (n *Node) handleElectionMessage(msg *ElectionMessage) {
 			n.log.Warn("[Election] Received message for dead/unknown candidate %s. Dropping and restarting.", msg.CandidateID)
 			n.info.Participant = false
 			n.rw.Unlock()
-			n.InitiateElection()
+			n.initiateElection()
 			return
 		}
 	}
@@ -177,7 +187,7 @@ func (n *Node) restartElectionAfterTimeOut() {
 		if n.info.Participant {
 			n.info.Participant = false
 			n.rw.Unlock()
-			n.InitiateElection()
+			n.initiateElection()
 			return
 		}
 		n.rw.Unlock()

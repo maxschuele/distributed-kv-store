@@ -127,9 +127,9 @@ func (c *Client) pickNode(key string) (NodeInfo, string, error) {
 		return NodeInfo{}, "", err
 	}
 
-	node, err := c.clusterView.GetNode(id)
-	if err != nil {
-		return NodeInfo{}, "", err
+	node, exists := c.clusterView.GetNode(id)
+	if !exists {
+		return NodeInfo{}, "", fmt.Errorf("node %s not found in cluster view", id.String())
 	}
 
 	return node, netutil.FormatAddress(node.Host, node.HttpPort), nil

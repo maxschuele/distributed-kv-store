@@ -2,13 +2,9 @@ package httpserver
 
 import (
 	"bufio"
-	"context"
 	"fmt"
 	"net"
 	"strings"
-	"syscall"
-
-	"golang.org/x/sys/unix"
 )
 
 type Method int
@@ -48,6 +44,7 @@ type HandlerFunc func(w *ResponseWriter, r *Request)
 type Server struct {
 	listener *net.TCPListener
 	routes   map[Method]map[string]HandlerFunc // method -> path -> handler
+	Port     uint16
 }
 
 func New() *Server {
@@ -57,25 +54,14 @@ func New() *Server {
 }
 
 func (s *Server) Bind(addr *net.TCPAddr) error {
-	lc := net.ListenConfig{
-		Control: func(network, address string, c syscall.RawConn) error {
-			var opErr error
-			err := c.Control(func(fd uintptr) {
-				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-			})
-			if err != nil {
-				return err
-			}
-			return opErr
-		},
-	}
-
-	listener, err := lc.Listen(context.Background(), "tcp4", addr.String())
+	listener, err := net.ListenTCP("tcp4", addr)
 	if err != nil {
 		return err
 	}
 
-	s.listener = listener.(*net.TCPListener)
+	s.listener = listener
+	s.Port = uint16(listener.Addr().(*net.TCPAddr).Port)
+
 	return nil
 }
 

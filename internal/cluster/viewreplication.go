@@ -57,7 +57,10 @@ func (gv *ReplicationGroupView) AddOrUpdateNode(i NodeInfo) {
 			LastSeen:     time.Now(),
 			DiscoveredAt: time.Now(),
 		}
-		gv.log.Info("[ReplicationView] Discovered new node: %s", i.ID.String())
+
+		if i.ID != gv.ownID {
+			gv.log.Info("[ReplicationView] Discovered new node: %s", i.ID.String())
+		}
 	}
 }
 
@@ -165,6 +168,9 @@ func (gv *ReplicationGroupView) GetSuccessor(id uuid.UUID) (NodeInfo, error) {
 	for i, nodeID := range ids {
 		if nodeID == id {
 			successorIndex := (i + 1) % len(ids)
+			if ids[successorIndex] == id {
+				return NodeInfo{}, fmt.Errorf("[ReplicationView] Node %s has no successor (only node in group)", id.String())
+			}
 			return gv.nodes[ids[successorIndex]].Info, nil
 		}
 	}

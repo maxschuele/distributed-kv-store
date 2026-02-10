@@ -11,8 +11,6 @@ import (
 func main() {
 	replication := flag.Bool("replication", false, "Run node as replication node")
 	ip := flag.String("ip", "", "IP address to use")
-	httpPortRaw := flag.Uint("http-port", 0, "HTTP server address")
-	clusterPortRaw := flag.Uint("cluster-port", 0, "Cluster communication address")
 	groupPortRaw := flag.Uint("group-port", 0, "Group port")
 	logLevelStr := flag.String("log-level", "INFO", "Log level (DEBUG, INFO, WARN, ERROR)")
 	flag.Parse()
@@ -26,14 +24,11 @@ func main() {
 		exit("Error: %v\n", err)
 	}
 
-	clusterPort := validatePort(*clusterPortRaw, "cluster-port")
-
 	if *replication {
-		cluster.StartReplicationNode(*ip, clusterPort, logLevel)
+		cluster.StartReplicationNode(*ip, logLevel)
 	} else {
-		httpPort := validatePort(*httpPortRaw, "http-port")
 		groupPort := validatePort(*groupPortRaw, "group-port")
-		cluster.StartNode(*ip, clusterPort, httpPort, groupPort, logLevel)
+		cluster.StartNode(*ip, groupPort, logLevel)
 	}
 
 	select {}

@@ -27,6 +27,7 @@ func (cv *ClusterGroupView) AddOrUpdateNode(i NodeInfo) {
 	defer cv.mu.Unlock()
 
 	if record, exists := cv.nodes[i.GroupID]; exists {
+		record.Info = i
 		record.LastSeen = time.Now()
 	} else {
 		cv.nodes[i.GroupID] = &NodeRecord{

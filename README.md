@@ -1,13 +1,13 @@
 Start leader node:
 
 ```sh
-go run ./cmd/node -ip 192.168.0.99 -http-port 8080 -cluster-port 8081 -group-port 8082
+go run ./cmd/node -ip 192.168.0.99 -group-port 8080
 ```
 
 Start replication node:
 
 ```sh
-go run ./cmd/node -ip 192.168.0.99 -cluster-port 8083
+go run ./cmd/node -replication -ip 192.168.0.99
 ```
 
 Start client:

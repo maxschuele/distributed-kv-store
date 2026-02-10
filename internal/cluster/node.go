@@ -1,7 +1,6 @@
 package cluster
 
 import (
-	"context"
 	"distributed-kv-store/internal/broadcast"
 	"distributed-kv-store/internal/consistent"
 	"distributed-kv-store/internal/httpclient"
@@ -11,6 +10,7 @@ import (
 	"distributed-kv-store/internal/netutil"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"sync"
 	"time"
@@ -52,30 +52,18 @@ type Node struct {
 }
 
 type nodeConfig struct {
-	ip          string
-	clusterPort uint16
-	httpPort    uint16
-	groupPort   uint16
-	isLeader    bool
-	logLevel    logger.Level
+	ip        string
+	groupPort uint16
+	isLeader  bool
+	logLevel  logger.Level
 }
 
-func StartNode(ip string, clusterPort uint16, httpPort uint16, groupPort uint16, logLevel logger.Level) {
-	if err := netutil.ValidatePort(httpPort); err != nil {
-		logger.New(logger.DEBUG).Fatal("invalid http port: %v", err)
-	}
-
-	if err := netutil.ValidatePort(groupPort); err != nil {
-		logger.New(logger.DEBUG).Fatal("invalid group port: %v", err)
-	}
-
+func StartNode(ip string, groupPort uint16, logLevel logger.Level) {
 	n, err := newBaseNode(nodeConfig{
-		ip:          ip,
-		clusterPort: clusterPort,
-		httpPort:    httpPort,
-		groupPort:   groupPort,
-		isLeader:    true,
-		logLevel:    logLevel,
+		ip:        ip,
+		groupPort: groupPort,
+		isLeader:  true,
+		logLevel:  logLevel,
 	})
 	if err != nil {
 		logger.New(logger.DEBUG).Fatal("%v", err)
@@ -88,17 +76,16 @@ func StartNode(ip string, clusterPort uint16, httpPort uint16, groupPort uint16,
 	n.startLeaderActivities()
 }
 
-func StartReplicationNode(ip string, clusterPort uint16, logLevel logger.Level) {
+func StartReplicationNode(ip string, logLevel logger.Level) {
 	n, err := newBaseNode(nodeConfig{
-		ip:          ip,
-		clusterPort: clusterPort,
-		logLevel:    logLevel,
+		ip:       ip,
+		logLevel: logLevel,
 	})
 	if err != nil {
 		logger.New(logger.DEBUG).Fatal("%v", err)
 	}
 
-	n.log.Info("starting replication node %s with cluster port %d and broadcast port %d", n.info.ID.String(), clusterPort, broadcastPort)
+	n.log.Info("starting replication node %s")
 
 	for !n.replicationGroupJoin() {
 	}
@@ -114,15 +101,9 @@ func newBaseNode(cfg nodeConfig) (*Node, error) {
 		return nil, fmt.Errorf("invalid ip: %w", err)
 	}
 
-	if err := netutil.ValidatePort(cfg.clusterPort); err != nil {
-		return nil, fmt.Errorf("invalid cluster port: %w", err)
-	}
-
 	info := NodeInfo{
 		ID:       uuid.New(),
 		Host:     ip,
-		Port:     cfg.clusterPort,
-		HttpPort: cfg.httpPort,
 		IsLeader: cfg.isLeader,
 	}
 	if cfg.isLeader {
@@ -141,10 +122,7 @@ func newBaseNode(cfg nodeConfig) (*Node, error) {
 		iface:           iface,
 	}
 
-	// add self to replication view (needed for election)
-	n.replicationView.AddOrUpdateNode(info)
-
-	clusterTcpAddr, err := netutil.ParseTcp4Addr(ip, cfg.clusterPort)
+	clusterTcpAddr, err := netutil.ParseTcp4Addr(ip, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse cluster tcp address: %w", err)
 	}
@@ -153,6 +131,12 @@ func newBaseNode(cfg nodeConfig) (*Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to set up cluster listener: %w", err)
 	}
+
+	n.info.Port = uint16(n.clusterListener.Addr().(*net.TCPAddr).Port)
+	// add self to replication view (needed for election), has to be done after getting the clusterListener port
+	n.replicationView.AddOrUpdateNode(n.info)
+
+	n.log.Info("started cluster listener on port %d", n.info.Port)
 
 	return n, nil
 }
@@ -168,86 +152,6 @@ func (n *Node) startActivities() {
 
 	go n.sendHeartbeats(n.groupPort)
 	go n.replicationView.StartHeartbeatMonitor(HeartbeatTimeout, HeartbeatInterval, n.handleReplicationGroupNodeRemoval)
-}
-
-func (n *Node) leaderMulticast(payload []byte) {
-	leaderId := n.info.ID
-	multicastMembers := n.getReplicationGroupParticipants()
-
-	rom := multicast.NewReliableFIFOMulticast(leaderId, leaderId, multicastMembers, n.log)
-	rom.Start()
-
-	go rom.InitializeUnicastListener(int(n.info.Port))
-	go rom.InitializeMulticastListenerOnPort(int(n.groupPort))
-	time.Sleep(100 * time.Millisecond)
-
-	rom.SendMulticast(payload) // TODO: call when notify members
-}
-
-// TODO: handle payload
-func (n *Node) multicastReceiveAndRetransmit() {
-	leaderId := n.getLeaderId()
-	multicastMembers := n.getReplicationGroupParticipants()
-	leaderAddr := n.getLeaderAddr()
-
-	rom := multicast.NewReliableFIFOMulticastWithLeaderAddr(n.info.ID, leaderId, multicastMembers, leaderAddr, n.log)
-	rom.Start()
-
-	go rom.InitializeUnicastListener(int(n.info.Port))
-	go rom.InitializeMulticastListenerOnPort(int(n.groupPort))
-	time.Sleep(100 * time.Millisecond)
-
-	delivered := 0
-	go func() {
-		for msg := range rom.GetDeliveryChannel() {
-			delivered++
-			n.log.Info("delivered message: %s", string(msg.Payload))
-		}
-	}()
-}
-
-func (n *Node) getLeaderId() uuid.UUID {
-	n.rw.RLock()
-	defer n.rw.RUnlock()
-
-	for id, node := range n.replicationView.nodes {
-		if node.Info.IsLeader {
-			return id
-		}
-	}
-
-	return uuid.Nil
-}
-
-// a function that returns replication view members uuid.UUIDs
-func (n *Node) getReplicationGroupParticipants() []uuid.UUID {
-	n.rw.RLock()
-	defer n.rw.RUnlock()
-
-	multicastMembers := []uuid.UUID{}
-	for id, node := range n.replicationView.nodes {
-		if node.Info.GroupID == n.info.GroupID {
-			multicastMembers = append(multicastMembers, id)
-		}
-	}
-
-	return multicastMembers
-}
-
-func (n *Node) getLeaderAddr() *net.UDPAddr {
-	n.rw.RLock()
-	defer n.rw.RUnlock()
-
-	for _, node := range n.replicationView.nodes {
-		if node.Info.IsLeader {
-			return &net.UDPAddr{
-				IP:   node.Info.Host[:],
-				Port: int(node.Info.Port),
-			}
-		}
-	}
-
-	return nil
 }
 
 func (n *Node) startLeaderActivities() {
@@ -514,21 +418,14 @@ func (n *Node) replicationGroupJoin() bool {
 	responses := make(map[uuid.UUID]MessageGroupInfo)
 	mu := sync.Mutex{}
 	wg := sync.WaitGroup{}
-
-	// Start listener with timeout
-	timeout := 5 * time.Second
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(2 * time.Second)
 	n.clusterListener.SetDeadline(deadline)
 	defer n.clusterListener.SetDeadline(time.Time{})
 
-	// Accept connections in background
-	ctx, cancel := context.WithDeadline(context.Background(), deadline)
-	defer cancel()
-
+	// Start accepting connections before broadcasting
+	acceptDone := make(chan struct{})
 	go func() {
-		header := MessageHeader{}
-		msg := MessageGroupInfo{}
-
+		defer close(acceptDone)
 		for time.Now().Before(deadline) {
 			conn, err := n.clusterListener.Accept()
 			if err != nil {
@@ -538,66 +435,23 @@ func (n *Node) replicationGroupJoin() bool {
 				n.log.Error("failed to accept connection: %v", err)
 				return
 			}
-
 			wg.Add(1)
 			go func(c net.Conn) {
-				n.log.Info("got messasge")
 				defer wg.Done()
 				defer c.Close()
-
-				buf := make([]byte, header.SizeBytes()+msg.SizeBytes())
-
-				// Read magic
-				if _, err := io.ReadFull(c, buf[0:4]); err != nil {
-					n.log.Error("failed to read magic: %v", err)
-					return
+				header, msg, ok := n.readGroupInfo(c)
+				if ok {
+					mu.Lock()
+					responses[header.ID] = msg
+					mu.Unlock()
 				}
-				if !isClusterMessage(buf) {
-					n.log.Info("not node message")
-					return
-				}
-
-				// Read rest of header
-				if _, err := io.ReadFull(c, buf[4:header.SizeBytes()]); err != nil {
-					n.log.Error("failed to read header: %v", err)
-					return
-				}
-				if err := header.Unmarshal(buf); err != nil {
-					n.log.Error("failed to unmarshal header: %v", err)
-					return
-				}
-				if header.Type != MessageTypeGroupInfo {
-					n.log.Info("not group info")
-					return
-				}
-
-				// Read message body
-				if _, err := io.ReadFull(c, buf[header.SizeBytes():header.SizeBytes()+msg.SizeBytes()]); err != nil {
-					n.log.Error("failed to read message body: %v", err)
-					return
-				}
-				if err := msg.Unmarshal(buf[header.SizeBytes():]); err != nil {
-					n.log.Error("failed to unmarshal group info: %v", err)
-					return
-				}
-
-				n.log.Info("got group info from %s", header.ID)
-				mu.Lock()
-				responses[header.ID] = msg
-				mu.Unlock()
 			}(conn)
 		}
 	}()
 
 	// Broadcast join request
-	h := MessageHeader{
-		ID:   n.info.ID,
-		Type: MessageTypeGroupJoin,
-	}
-	m := MessageGroupJoin{
-		Host: n.info.Host,
-		Port: n.info.Port,
-	}
+	h := MessageHeader{ID: n.info.ID, Type: MessageTypeGroupJoin}
+	m := MessageGroupJoin{Host: n.info.Host, Port: n.info.Port}
 	buf := make([]byte, h.SizeBytes()+m.SizeBytes())
 	if err := h.Marshal(buf); err != nil {
 		n.log.Error("failed to marshal broadcast header: %v", err)
@@ -607,31 +461,22 @@ func (n *Node) replicationGroupJoin() bool {
 		n.log.Error("failed to marshal group join message: %v", err)
 		return false
 	}
-
-	for range 4 {
-		if err := broadcast.Send(broadcastPort, buf); err != nil {
-			n.log.Error("failed to send group join broadcast message: %v", err)
-		}
-		n.log.Info("sent group join broadcast message")
-		// if i < 3 {
-		time.Sleep(1 * time.Second)
-		// }
+	if err := broadcast.Send(broadcastPort, buf); err != nil {
+		n.log.Error("failed to send group join broadcast: %v", err)
+		return false
 	}
+	n.log.Info("sent group join broadcast message")
 
-	<-ctx.Done()
+	<-acceptDone
 	wg.Wait()
-
-	mu.Lock()
-	defer mu.Unlock()
 
 	if len(responses) == 0 {
 		return false
 	}
 
-	// Select the group with the least members
+	// Select the group with the fewest members
 	var selectedID uuid.UUID
-	minMembers := int(^uint(0) >> 1) // max int
-
+	minMembers := math.MaxInt
 	for id, info := range responses {
 		if int(info.GroupSize) < minMembers {
 			minMembers = int(info.GroupSize)
@@ -640,26 +485,57 @@ func (n *Node) replicationGroupJoin() bool {
 	}
 
 	n.log.Info("selected group %s with %d members", selectedID, minMembers)
-
 	selected := responses[selectedID]
-
-	n.info.HttpPort = selected.HttpPort
 	n.groupPort = selected.GroupPort
 	n.info.GroupID = selected.GroupID
-
 	n.replicationView.AddOrUpdateNode(NodeInfo{
 		ID:       selectedID,
 		GroupID:  selected.GroupID,
 		Host:     selected.LeaderHost,
 		Port:     selected.LeaderPort,
+		HttpPort: selected.HttpPort,
 		IsLeader: true,
 	})
-
 	return true
 }
 
+func (n *Node) readGroupInfo(conn net.Conn) (MessageHeader, MessageGroupInfo, bool) {
+	var header MessageHeader
+	var msg MessageGroupInfo
+	buf := make([]byte, header.SizeBytes()+msg.SizeBytes())
+
+	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
+		n.log.Error("failed to read magic: %v", err)
+		return header, msg, false
+	}
+	if !isClusterMessage(buf) {
+		return header, msg, false
+	}
+	if _, err := io.ReadFull(conn, buf[4:header.SizeBytes()]); err != nil {
+		n.log.Error("failed to read header: %v", err)
+		return header, msg, false
+	}
+	if err := header.Unmarshal(buf); err != nil {
+		n.log.Error("failed to unmarshal header: %v", err)
+		return header, msg, false
+	}
+	if header.Type != MessageTypeGroupInfo {
+		return header, msg, false
+	}
+	if _, err := io.ReadFull(conn, buf[header.SizeBytes():header.SizeBytes()+msg.SizeBytes()]); err != nil {
+		n.log.Error("failed to read body: %v", err)
+		return header, msg, false
+	}
+	if err := msg.Unmarshal(buf[header.SizeBytes():]); err != nil {
+		n.log.Error("failed to unmarshal group info: %v", err)
+		return header, msg, false
+	}
+	return header, msg, true
+}
+
 func (n *Node) startHttpServer() {
-	httpAddr, err := netutil.ParseTcp4Addr(n.info.Host, n.info.HttpPort)
+	httpAddr, err := netutil.ParseTcp4Addr(n.info.Host, 0)
+
 	if err != nil {
 		n.log.Fatal("invalid HTTp address: %v", err)
 	}
@@ -667,10 +543,12 @@ func (n *Node) startHttpServer() {
 	if err := n.httpServer.Bind(httpAddr); err != nil {
 		n.log.Fatal("failed to start http server: %v", err)
 	}
+	n.info.HttpPort = n.httpServer.Port
 	n.httpServer.RegisterHandler(httpserver.GET, "/kv", n.handleGetKey)
 	n.httpServer.RegisterHandler(httpserver.PUT, "/kv", n.handlePutKey)
 	n.httpServer.RegisterHandler(httpserver.DELETE, "/kv", n.handleDeleteKey)
 
+	n.log.Info("Starting http server on port %d", n.info.HttpPort)
 	if err := n.httpServer.Listen(); err != nil {
 		n.log.Error("[Node] Error in HTTP Listen: %v", err)
 	}
@@ -720,7 +598,7 @@ func (n *Node) handlePutKey(w *httpserver.ResponseWriter, r *httpserver.Request)
 
 	val := r.Body
 	n.storage.Set(key, r.Body)
-	n.writeNotifyMembers(key, val) // TODO: replace with multicast
+	n.writeNotifyMembers(key, val) // TODO: use with multicast
 
 	w.Status(200, "OK")
 	w.Write([]byte("OK"))
@@ -750,7 +628,7 @@ func (n *Node) handleDeleteKey(w *httpserver.ResponseWriter, r *httpserver.Reque
 	}
 
 	n.storage.Delete(key)
-	n.deleteNotifyMembers(key) // TODO: replace with multicast
+	n.deleteNotifyMembers(key) // TODO: use multicast
 
 	w.Status(200, "OK")
 	w.Write([]byte("OK"))
@@ -778,4 +656,84 @@ func (n *Node) notifyMembers(data []byte) {
 	// 		// TODO: handle error appropriately
 	// 	}
 	// }
+}
+
+func (n *Node) leaderMulticast(payload []byte) {
+	leaderId := n.info.ID
+	multicastMembers := n.getReplicationGroupParticipants()
+
+	rom := multicast.NewReliableFIFOMulticast(leaderId, leaderId, multicastMembers, n.log)
+	rom.Start()
+
+	go rom.InitializeUnicastListener(int(n.info.Port))
+	go rom.InitializeMulticastListenerOnPort(int(n.groupPort))
+	time.Sleep(100 * time.Millisecond)
+
+	rom.SendMulticast(payload) // TODO: call when notify members
+}
+
+// TODO: handle payload
+func (n *Node) multicastReceiveAndRetransmit() {
+	leaderId := n.getLeaderId()
+	multicastMembers := n.getReplicationGroupParticipants()
+	leaderAddr := n.getLeaderAddr()
+
+	rom := multicast.NewReliableFIFOMulticastWithLeaderAddr(n.info.ID, leaderId, multicastMembers, leaderAddr, n.log)
+	rom.Start()
+
+	go rom.InitializeUnicastListener(int(n.info.Port))
+	go rom.InitializeMulticastListenerOnPort(int(n.groupPort))
+	time.Sleep(100 * time.Millisecond)
+
+	delivered := 0
+	go func() {
+		for msg := range rom.GetDeliveryChannel() {
+			delivered++
+			n.log.Info("delivered message: %s", string(msg.Payload))
+		}
+	}()
+}
+
+func (n *Node) getLeaderId() uuid.UUID {
+	n.rw.RLock()
+	defer n.rw.RUnlock()
+
+	for id, node := range n.replicationView.nodes {
+		if node.Info.IsLeader {
+			return id
+		}
+	}
+
+	return uuid.Nil
+}
+
+// a function that returns replication view members uuid.UUIDs
+func (n *Node) getReplicationGroupParticipants() []uuid.UUID {
+	n.rw.RLock()
+	defer n.rw.RUnlock()
+
+	multicastMembers := []uuid.UUID{}
+	for id, node := range n.replicationView.nodes {
+		if node.Info.GroupID == n.info.GroupID {
+			multicastMembers = append(multicastMembers, id)
+		}
+	}
+
+	return multicastMembers
+}
+
+func (n *Node) getLeaderAddr() *net.UDPAddr {
+	n.rw.RLock()
+	defer n.rw.RUnlock()
+
+	for _, node := range n.replicationView.nodes {
+		if node.Info.IsLeader {
+			return &net.UDPAddr{
+				IP:   node.Info.Host[:],
+				Port: int(node.Info.Port),
+			}
+		}
+	}
+
+	return nil
 }
