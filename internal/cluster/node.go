@@ -667,15 +667,14 @@ func (n *Node) deleteNotifyMembers(key string) {
 
 func (n *Node) notifyMembers(data []byte) {
 	n.rw.RLock()
-	mcast := n.mcast
-	n.rw.RUnlock()
+	defer n.rw.RUnlock()
 
-	if mcast == nil {
+	if n.mcast == nil {
 		n.log.Debug("[multicast] not initialized, skipping propagation")
 		return
 	}
 
-	if _, err := mcast.SendMulticast(data); err != nil {
+	if _, err := n.mcast.SendMulticast(data); err != nil {
 		n.log.Error("[multicast] failed to send: %v", err)
 	}
 }

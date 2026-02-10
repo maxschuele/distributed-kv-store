@@ -139,6 +139,7 @@ func (c *Client) doGet(key string) {
 	node, addr, err := c.pickNode(key)
 	if err != nil {
 		fmt.Printf("failed to pick node: %v\n", err)
+		return
 	}
 
 	resp, err := c.httpClient.Get(addr, "/kv?key="+key)
@@ -157,6 +158,7 @@ func (c *Client) doPut(key, value string) {
 	node, addr, err := c.pickNode(key)
 	if err != nil {
 		fmt.Printf("failed to pick node: %v\n", err)
+		return
 	}
 
 	resp, err := c.httpClient.Put(addr, "/kv?key="+key, value)
@@ -175,6 +177,7 @@ func (c *Client) doDelete(key string) {
 	node, addr, err := c.pickNode(key)
 	if err != nil {
 		fmt.Printf("failed to pick node: %v\n", err)
+		return
 	}
 
 	resp, err := c.httpClient.Delete(addr, "/kv?key="+key)
