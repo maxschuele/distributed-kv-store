@@ -166,7 +166,7 @@ func (n *Node) forwardElectionMessage(msg *ElectionMessage) {
 		errTCP := n.sendTcpMessage(recipient, data)
 		if errTCP != nil {
 			// try resending
-			n.log.Error("[Election] Failed to send message to successor %s: %v", recipient, err)
+			n.log.Error("[Election] Failed to send message to successor %s: %v", recipient, errTCP)
 			time.Sleep(HeartbeatTimeout)
 		} else {
 			break

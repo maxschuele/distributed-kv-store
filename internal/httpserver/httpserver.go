@@ -3,6 +3,7 @@ package httpserver
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 )
@@ -173,7 +174,9 @@ func parseRequest(conn net.Conn) (*Request, error) {
 
 	if contentLength > 0 {
 		body := make([]byte, contentLength)
-		reader.Read(body)
+		if _, err := io.ReadFull(reader, body); err != nil {
+			return nil, fmt.Errorf("failed to read request body: %w", err)
+		}
 		req.Body = string(body)
 	}
 
