@@ -715,7 +715,7 @@ func (n *Node) initMulticast() {
 	}
 
 	if leaderID == uuid.Nil {
-		n.log.Warn("[multicast] no leader found, retrying init soon")
+		n.log.Debug("[multicast] no leader found, retrying init soon")
 		time.AfterFunc(500*time.Millisecond, n.initMulticast)
 		return
 	}
