@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"distributed-kv-store/internal/broadcast"
 	"distributed-kv-store/internal/consistent"
 	"distributed-kv-store/internal/httpclient"
@@ -49,6 +50,9 @@ type Node struct {
 	broadcastPort   uint16
 	groupPort       uint16
 	iface           *net.Interface
+
+	mcast     *multicast.ReliableFIFOMulticast
+	mcastStop chan struct{}
 }
 
 type nodeConfig struct {
@@ -91,6 +95,7 @@ func StartReplicationNode(ip string, logLevel logger.Level) {
 	}
 
 	n.startActivities()
+	n.initMulticast()
 }
 
 func newBaseNode(cfg nodeConfig) (*Node, error) {
@@ -172,12 +177,16 @@ func (n *Node) startLeaderActivities() {
 
 	n.httpServer = httpserver.New()
 	go n.startHttpServer()
+
+	n.initMulticast()
 }
 
 func (n *Node) handleReplicationGroupNodeRemoval(removedNode NodeInfo) {
 	if removedNode.IsLeader {
 		n.initiateElection()
 	}
+	// Rebuild multicast with the updated participant set.
+	n.initMulticast()
 }
 
 func (n *Node) handleClusterGroupNodeRemoval(removedNode NodeInfo) {
@@ -339,7 +348,14 @@ func (n *Node) handleReplicationBroadcastMessage(buf []byte, remoteAddr *net.UDP
 			return
 		}
 
+		_, err := n.replicationView.GetNode(msg.Info.ID)
+		isNew := err != nil
 		n.replicationView.AddOrUpdateNode(msg.Info)
+
+		// A new node joined the replication group — rebuild multicast.
+		if isNew {
+			n.initMulticast()
+		}
 	}
 }
 
@@ -598,7 +614,7 @@ func (n *Node) handlePutKey(w *httpserver.ResponseWriter, r *httpserver.Request)
 
 	val := r.Body
 	n.storage.Set(key, r.Body)
-	n.writeNotifyMembers(key, val) // TODO: use with multicast
+	n.writeNotifyMembers(key, val)
 
 	w.Status(200, "OK")
 	w.Write([]byte("OK"))
@@ -628,7 +644,7 @@ func (n *Node) handleDeleteKey(w *httpserver.ResponseWriter, r *httpserver.Reque
 	}
 
 	n.storage.Delete(key)
-	n.deleteNotifyMembers(key) // TODO: use multicast
+	n.deleteNotifyMembers(key)
 
 	w.Status(200, "OK")
 	w.Write([]byte("OK"))
@@ -650,90 +666,166 @@ func (n *Node) deleteNotifyMembers(key string) {
 }
 
 func (n *Node) notifyMembers(data []byte) {
-	// TODO: use multicast for this
-	// for addr := range n.group {
-	// 	if err := n.notifyPeer(addr, data); err != nil {
-	// 		// TODO: handle error appropriately
-	// 	}
-	// }
-}
-
-func (n *Node) leaderMulticast(payload []byte) {
-	leaderId := n.info.ID
-	multicastMembers := n.getReplicationGroupParticipants()
-
-	rom := multicast.NewReliableFIFOMulticast(leaderId, leaderId, multicastMembers, n.log)
-	rom.Start()
-
-	go rom.InitializeUnicastListener(int(n.info.Port))
-	go rom.InitializeMulticastListenerOnPort(int(n.groupPort))
-	time.Sleep(100 * time.Millisecond)
-
-	rom.SendMulticast(payload) // TODO: call when notify members
-}
-
-// TODO: handle payload
-func (n *Node) multicastReceiveAndRetransmit() {
-	leaderId := n.getLeaderId()
-	multicastMembers := n.getReplicationGroupParticipants()
-	leaderAddr := n.getLeaderAddr()
-
-	rom := multicast.NewReliableFIFOMulticastWithLeaderAddr(n.info.ID, leaderId, multicastMembers, leaderAddr, n.log)
-	rom.Start()
-
-	go rom.InitializeUnicastListener(int(n.info.Port))
-	go rom.InitializeMulticastListenerOnPort(int(n.groupPort))
-	time.Sleep(100 * time.Millisecond)
-
-	delivered := 0
-	go func() {
-		for msg := range rom.GetDeliveryChannel() {
-			delivered++
-			n.log.Info("delivered message: %s", string(msg.Payload))
-		}
-	}()
-}
-
-func (n *Node) getLeaderId() uuid.UUID {
 	n.rw.RLock()
-	defer n.rw.RUnlock()
+	mcast := n.mcast
+	n.rw.RUnlock()
 
-	for id, node := range n.replicationView.nodes {
-		if node.Info.IsLeader {
-			return id
-		}
+	if mcast == nil {
+		n.log.Debug("[multicast] not initialized, skipping propagation")
+		return
 	}
 
-	return uuid.Nil
+	if _, err := mcast.SendMulticast(data); err != nil {
+		n.log.Error("[multicast] failed to send: %v", err)
+	}
 }
 
-// a function that returns replication view members uuid.UUIDs
-func (n *Node) getReplicationGroupParticipants() []uuid.UUID {
-	n.rw.RLock()
-	defer n.rw.RUnlock()
+// initMulticast tears down any existing multicast instance and creates a new
+// one that reflects the current replication group membership. It is safe to
+// call multiple times (e.g. after membership changes).
+func (n *Node) initMulticast() {
+	n.stopMulticast()
 
-	multicastMembers := []uuid.UUID{}
-	for id, node := range n.replicationView.nodes {
-		if node.Info.GroupID == n.info.GroupID {
-			multicastMembers = append(multicastMembers, id)
-		}
+	nodes := n.replicationView.GetNodes()
+	if len(nodes) < 2 {
+		n.log.Debug("[multicast] not enough participants (%d), skipping init", len(nodes))
+		return
 	}
 
-	return multicastMembers
-}
-
-func (n *Node) getLeaderAddr() *net.UDPAddr {
-	n.rw.RLock()
-	defer n.rw.RUnlock()
-
-	for _, node := range n.replicationView.nodes {
-		if node.Info.IsLeader {
-			return &net.UDPAddr{
-				IP:   node.Info.Host[:],
-				Port: int(node.Info.Port),
+	// Determine leader and build participant list.
+	var leaderID uuid.UUID
+	var leaderAddr *net.UDPAddr
+	participants := make([]uuid.UUID, 0, len(nodes))
+	for _, ni := range nodes {
+		participants = append(participants, ni.ID)
+		if ni.IsLeader {
+			leaderID = ni.ID
+			leaderAddr = &net.UDPAddr{
+				IP:   net.IP(ni.Host[:]),
+				Port: int(ni.Port),
 			}
 		}
 	}
 
-	return nil
+	if leaderID == uuid.Nil {
+		n.log.Error("[multicast] no leader found in replication view, skipping init")
+		return
+	}
+
+	isLeader := n.info.ID == leaderID
+
+	var rom *multicast.ReliableFIFOMulticast
+	if isLeader {
+		rom = multicast.NewReliableFIFOMulticast(n.info.ID, leaderID, participants, n.log)
+	} else {
+		rom = multicast.NewReliableFIFOMulticastWithLeaderAddr(n.info.ID, leaderID, participants, leaderAddr, n.log)
+	}
+
+	rom.Start()
+
+	// Register unicast addresses for all peers so NAK/retransmit can reach them.
+	for _, ni := range nodes {
+		if ni.ID != n.info.ID {
+			rom.SetPeerAddr(ni.ID, &net.UDPAddr{
+				IP:   net.IP(ni.Host[:]),
+				Port: int(ni.Port),
+			})
+		}
+	}
+
+	mcastPort := int(n.groupPort) + 1
+
+	if err := rom.InitializeUnicastListener(int(n.info.Port)); err != nil {
+		n.log.Error("[multicast] failed to start unicast listener: %v", err)
+		rom.Stop()
+		return
+	}
+	if err := rom.InitializeMulticastListenerOnPort(mcastPort); err != nil {
+		n.log.Error("[multicast] failed to start multicast listener: %v", err)
+		rom.Stop()
+		return
+	}
+
+	stop := make(chan struct{})
+
+	n.rw.Lock()
+	n.mcast = rom
+	n.mcastStop = stop
+	n.rw.Unlock()
+
+	// Non-leader nodes consume delivered messages and apply them to storage.
+	if !isLeader {
+		go n.consumeMulticastDeliveries(rom, stop)
+	}
+
+	n.log.Info("[multicast] initialized (leader=%v, participants=%d, mcastPort=%d)",
+		isLeader, len(participants), mcastPort)
+}
+
+// stopMulticast tears down the current multicast instance, if any.
+func (n *Node) stopMulticast() {
+	n.rw.Lock()
+	rom := n.mcast
+	stop := n.mcastStop
+	n.mcast = nil
+	n.mcastStop = nil
+	n.rw.Unlock()
+
+	if rom != nil {
+		rom.Stop()
+	}
+	if stop != nil {
+		close(stop)
+	}
+}
+
+// consumeMulticastDeliveries reads fully-reassembled messages from the
+// multicast delivery channel and applies write/delete operations to storage.
+func (n *Node) consumeMulticastDeliveries(rom *multicast.ReliableFIFOMulticast, stop <-chan struct{}) {
+	ch := rom.GetDeliveryChannel()
+	for {
+		select {
+		case msg, ok := <-ch:
+			if !ok {
+				return
+			}
+			n.applyMulticastPayload(msg.Payload)
+		case <-stop:
+			return
+		}
+	}
+}
+
+// applyMulticastPayload deserialises a replicated write or delete and applies
+// it to the local storage.
+func (n *Node) applyMulticastPayload(payload []byte) {
+	msg, err := Unmarshal(bytes.NewReader(payload))
+	if err != nil {
+		n.log.Error("[multicast] failed to unmarshal payload: %v", err)
+		return
+	}
+
+	switch m := msg.(type) {
+	case *WriteRequestMessage:
+		n.storage.Set(string(m.Key), string(m.Value))
+		n.log.Debug("[multicast] applied write: key=%s", string(m.Key))
+	case *DeleteRequestMessage:
+		n.storage.Delete(string(m.Key))
+		n.log.Debug("[multicast] applied delete: key=%s", string(m.Key))
+	default:
+		n.log.Error("[multicast] unexpected message type in payload")
+	}
+}
+
+// getReplicationGroupParticipants returns the UUIDs of all nodes in this
+// node's replication group.
+func (n *Node) getReplicationGroupParticipants() []uuid.UUID {
+	nodes := n.replicationView.GetNodes()
+	participants := make([]uuid.UUID, 0, len(nodes))
+	for _, ni := range nodes {
+		if ni.GroupID == n.info.GroupID {
+			participants = append(participants, ni.ID)
+		}
+	}
+	return participants
 }

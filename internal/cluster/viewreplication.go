@@ -64,6 +64,19 @@ func (gv *ReplicationGroupView) AddOrUpdateNode(i NodeInfo) {
 	}
 }
 
+// UpdateSelf unconditionally updates the own node's record in the view.
+// Use this after local state changes (e.g. winning an election) that are not
+// propagated through broadcast messages the node listens to.
+func (gv *ReplicationGroupView) UpdateSelf(i NodeInfo) {
+	gv.mu.Lock()
+	defer gv.mu.Unlock()
+
+	if record, exists := gv.nodes[gv.ownID]; exists {
+		record.Info = i
+		record.LastSeen = time.Now()
+	}
+}
+
 // GetNodes returns all known nodes
 func (gv *ReplicationGroupView) GetNodes() []NodeInfo {
 	gv.mu.RLock()

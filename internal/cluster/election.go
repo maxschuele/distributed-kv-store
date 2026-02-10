@@ -29,6 +29,7 @@ func (n *Node) initiateElection() {
 	if n.replicationView.Size() <= 1 {
 		n.info.IsLeader = true
 		n.info.Participant = false
+		n.replicationView.UpdateSelf(n.info)
 		n.rw.Unlock()
 		n.log.Info("[Election] Only node in group, self-electing as leader")
 		n.startLeaderActivities()
@@ -120,6 +121,7 @@ func (n *Node) handleElectionMessage(msg *ElectionMessage) {
 		n.log.Info("[Election] I have won the election!")
 		n.info.IsLeader = true
 		n.info.Participant = false
+		n.replicationView.UpdateSelf(n.info)
 
 		// Send Leader Announcement
 		announceMsg := &ElectionMessage{
