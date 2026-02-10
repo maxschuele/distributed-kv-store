@@ -216,6 +216,8 @@ func (n *Node) handleClusterMessage(conn net.Conn) {
 	switch m := msg.(type) {
 	case *ElectionMessage:
 		n.handleElectionMessage(m)
+	case *StateTransferMessage:
+		n.applyStateTransfer(m)
 	}
 }
 
@@ -258,7 +260,6 @@ func (n *Node) sendTcpMessage(addr string, data []byte) error {
 	}
 	defer conn.Close()
 
-	// TODO: set a timeout, handle partial write
 	_, err = conn.Write(data)
 	if err != nil {
 		n.log.Error("[Node] Write to peer failed: %v", err)
@@ -313,7 +314,7 @@ func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 
 		n.sendMsg(netutil.FormatAddress(msg.Host, msg.Port), &MessageGroupInfo{
 			GroupID:    n.info.GroupID,
-			GroupSize:  uint32(n.replicationView.Size()), // TODO: fix cast
+			GroupSize:  uint32(n.replicationView.Size()),
 			LeaderHost: n.info.Host,
 			LeaderPort: n.info.Port,
 			GroupPort:  n.groupPort,
@@ -352,9 +353,12 @@ func (n *Node) handleReplicationBroadcastMessage(buf []byte, remoteAddr *net.UDP
 		isNew := err != nil
 		n.replicationView.AddOrUpdateNode(msg.Info)
 
-		// A new node joined the replication group — rebuild multicast.
 		if isNew {
 			n.initMulticast()
+
+			if n.info.IsLeader && msg.Info.ID != n.info.ID {
+				go n.sendStateTransfer(msg.Info)
+			}
 		}
 	}
 }
@@ -707,7 +711,7 @@ func (n *Node) initMulticast() {
 	}
 
 	if leaderID == uuid.Nil {
-		n.log.Warn("[multicast] no leader found, retrying init soon")
+		n.log.Debug("[multicast] no leader found, retrying init soon")
 		time.AfterFunc(500*time.Millisecond, n.initMulticast)
 		return
 	}
@@ -815,6 +819,34 @@ func (n *Node) applyMulticastPayload(payload []byte) {
 	default:
 		n.log.Error("[multicast] unexpected message type in payload")
 	}
+}
+
+// applyStateTransfer loads a state snapshot received from the leader into
+// the local storage.
+func (n *Node) applyStateTransfer(msg *StateTransferMessage) {
+	for k, v := range msg.Data {
+		n.storage.Set(k, v)
+	}
+	n.log.Info("[state-transfer] received and applied %d key-value pairs from leader", len(msg.Data))
+}
+
+// sendStateTransfer sends the full KV store snapshot to a newly-joined
+// replication node via direct TCP.
+func (n *Node) sendStateTransfer(target NodeInfo) {
+	data := n.storage.GetAll()
+	if len(data) == 0 {
+		n.log.Info("[state-transfer] no data to send to %s", target.ID.String())
+		return
+	}
+
+	msg := &StateTransferMessage{Data: data}
+	addr := netutil.FormatAddress(target.Host, target.Port)
+	if err := n.sendTcpMessage(addr, msg.Marshal()); err != nil {
+		n.log.Error("[state-transfer] failed to send to %s: %v", target.ID.String(), err)
+		return
+	}
+
+	n.log.Info("[state-transfer] sent %d key-value pairs to %s", len(data), target.ID.String())
 }
 
 // getReplicationGroupParticipants returns the UUIDs of all nodes in this

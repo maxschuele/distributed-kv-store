@@ -26,6 +26,7 @@ const (
 	MessageTypeElection      MessageType = 0x06
 	MessageTypeGroupJoin     MessageType = 0x07
 	MessageTypeGroupInfo     MessageType = 0x08
+	MessageTypeStateTransfer MessageType = 0x09
 )
 
 const MessageHeaderMagic uint32 = 0x44534B56 // "DSKV" in ASCII
@@ -377,6 +378,51 @@ func (d *DeleteRequestMessage) Marshal() []byte {
 	return buf
 }
 
+// StateTransferMessage carries a full snapshot of the leader's KV store so
+// that a newly-joined replication node can catch up.
+//
+// Wire format (after the 1-byte type tag):
+//
+//	[4 bytes: pair count (N)]
+//	for each pair:
+//	  [4 bytes: key length]
+//	  [key bytes]
+//	  [4 bytes: value length]
+//	  [value bytes]
+type StateTransferMessage struct {
+	Data map[string]string
+}
+
+func (s *StateTransferMessage) Type() MessageType {
+	return MessageTypeStateTransfer
+}
+
+func (s *StateTransferMessage) Marshal() []byte {
+	// Calculate total size.
+	totalSize := 1 + 4 // type byte + pair count
+	for k, v := range s.Data {
+		totalSize += 4 + len(k) + 4 + len(v)
+	}
+
+	buf := make([]byte, totalSize)
+	buf[0] = byte(MessageTypeStateTransfer)
+	binary.BigEndian.PutUint32(buf[1:5], uint32(len(s.Data)))
+
+	offset := 5
+	for k, v := range s.Data {
+		binary.BigEndian.PutUint32(buf[offset:offset+4], uint32(len(k)))
+		offset += 4
+		copy(buf[offset:offset+len(k)], k)
+		offset += len(k)
+		binary.BigEndian.PutUint32(buf[offset:offset+4], uint32(len(v)))
+		offset += 4
+		copy(buf[offset:offset+len(v)], v)
+		offset += len(v)
+	}
+
+	return buf
+}
+
 func Unmarshal(r io.Reader) (TcpMessage, error) {
 	typeBuf := make([]byte, 1)
 	if _, err := io.ReadFull(r, typeBuf); err != nil {
@@ -469,6 +515,35 @@ func Unmarshal(r io.Reader) (TcpMessage, error) {
 		offset += 2
 		msg.GroupPort = binary.BigEndian.Uint16(buf[offset : offset+2])
 		return msg, nil
+	case MessageTypeStateTransfer:
+		countBuf := make([]byte, 4)
+		if _, err := io.ReadFull(r, countBuf); err != nil {
+			return nil, fmt.Errorf("failed to read state transfer pair count: %w", err)
+		}
+		count := binary.BigEndian.Uint32(countBuf)
+		data := make(map[string]string, count)
+		for i := uint32(0); i < count; i++ {
+			keyLenBuf := make([]byte, 4)
+			if _, err := io.ReadFull(r, keyLenBuf); err != nil {
+				return nil, fmt.Errorf("failed to read state transfer key length: %w", err)
+			}
+			keyLen := binary.BigEndian.Uint32(keyLenBuf)
+			key := make([]byte, keyLen)
+			if _, err := io.ReadFull(r, key); err != nil {
+				return nil, fmt.Errorf("failed to read state transfer key: %w", err)
+			}
+			valLenBuf := make([]byte, 4)
+			if _, err := io.ReadFull(r, valLenBuf); err != nil {
+				return nil, fmt.Errorf("failed to read state transfer value length: %w", err)
+			}
+			valLen := binary.BigEndian.Uint32(valLenBuf)
+			val := make([]byte, valLen)
+			if _, err := io.ReadFull(r, val); err != nil {
+				return nil, fmt.Errorf("failed to read state transfer value: %w", err)
+			}
+			data[string(key)] = string(val)
+		}
+		return &StateTransferMessage{Data: data}, nil
 	default:
 		return nil, fmt.Errorf("unknown message type: 0x%02x", msgType)
 	}
