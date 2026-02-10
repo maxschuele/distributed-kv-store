@@ -260,7 +260,6 @@ func (n *Node) sendTcpMessage(addr string, data []byte) error {
 	}
 	defer conn.Close()
 
-	// TODO: set a timeout, handle partial write
 	_, err = conn.Write(data)
 	if err != nil {
 		n.log.Error("[Node] Write to peer failed: %v", err)
@@ -315,7 +314,7 @@ func (n *Node) handleBroadcastMessage(buf []byte, remoteAddr *net.UDPAddr) {
 
 		n.sendMsg(netutil.FormatAddress(msg.Host, msg.Port), &MessageGroupInfo{
 			GroupID:    n.info.GroupID,
-			GroupSize:  uint32(n.replicationView.Size()), // TODO: fix cast
+			GroupSize:  uint32(n.replicationView.Size()),
 			LeaderHost: n.info.Host,
 			LeaderPort: n.info.Port,
 			GroupPort:  n.groupPort,
@@ -354,12 +353,9 @@ func (n *Node) handleReplicationBroadcastMessage(buf []byte, remoteAddr *net.UDP
 		isNew := err != nil
 		n.replicationView.AddOrUpdateNode(msg.Info)
 
-		// A new node joined the replication group — rebuild multicast.
 		if isNew {
 			n.initMulticast()
 
-			// If we are the leader, send the current state to the new node
-			// so it can catch up with existing KV pairs.
 			if n.info.IsLeader && msg.Info.ID != n.info.ID {
 				go n.sendStateTransfer(msg.Info)
 			}

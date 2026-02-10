@@ -154,7 +154,6 @@ func (n *Node) forwardElectionMessage(msg *ElectionMessage) {
 	for {
 		// determine successor node within group view
 		successorNode, err := n.replicationView.GetSuccessor(n.info.ID)
-		// TODO, what to do if there is no successor found
 		if err != nil {
 			n.log.Error(err.Error())
 			break
