@@ -89,7 +89,7 @@ func StartReplicationNode(ip string, logLevel logger.Level) {
 		logger.New(logger.DEBUG).Fatal("%v", err)
 	}
 
-	n.log.Info("starting replication node %s")
+	n.log.Info("starting replication node %s", n.info.ID.String())
 
 	for !n.replicationGroupJoin() {
 	}
@@ -500,8 +500,8 @@ func (n *Node) replicationGroupJoin() bool {
 		}
 	}
 
-	n.log.Info("selected group %s with %d members", selectedID, minMembers)
 	selected := responses[selectedID]
+	n.log.Info("selected group %s with %d members", selected.GroupID, minMembers)
 	n.groupPort = selected.GroupPort
 	n.info.GroupID = selected.GroupID
 	n.replicationView.AddOrUpdateNode(NodeInfo{
@@ -708,7 +708,8 @@ func (n *Node) initMulticast() {
 	}
 
 	if leaderID == uuid.Nil {
-		n.log.Error("[multicast] no leader found in replication view, skipping init")
+		n.log.Warn("[multicast] no leader found, retrying init soon")
+		time.AfterFunc(500*time.Millisecond, n.initMulticast)
 		return
 	}
 
@@ -808,10 +809,10 @@ func (n *Node) applyMulticastPayload(payload []byte) {
 	switch m := msg.(type) {
 	case *WriteRequestMessage:
 		n.storage.Set(string(m.Key), string(m.Value))
-		n.log.Debug("[multicast] applied write: key=%s", string(m.Key))
+		n.log.Info("[multicast] applied write: key=%s", string(m.Key))
 	case *DeleteRequestMessage:
 		n.storage.Delete(string(m.Key))
-		n.log.Debug("[multicast] applied delete: key=%s", string(m.Key))
+		n.log.Info("[multicast] applied delete: key=%s", string(m.Key))
 	default:
 		n.log.Error("[multicast] unexpected message type in payload")
 	}

@@ -72,6 +72,9 @@ func (n *Node) handleElectionMessage(msg *ElectionMessage) {
 			}
 			n.leaderAddr = netutil.FormatAddress(leaderNode.Host, leaderNode.Port)
 			n.rw.Unlock()
+
+			n.initMulticast()
+
 			n.forwardElectionMessage(msg)
 		} else {
 			n.leaderAddr = netutil.FormatAddress(n.info.Host, n.info.Port)

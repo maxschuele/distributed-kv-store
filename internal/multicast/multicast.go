@@ -208,7 +208,7 @@ func (rom *ReliableFIFOMulticast) Start() {
 	rom.startPeerSummaryRelay()
 
 	if rom.log != nil {
-		rom.log.Info("[FIFO] started for node %s (leader=%s)", rom.nodeID.String(), rom.leaderID.String())
+		rom.log.Debug("[FIFO] started for node %s (leader=%s)", rom.nodeID.String(), rom.leaderID.String())
 	}
 }
 
@@ -317,7 +317,7 @@ func (rom *ReliableFIFOMulticast) Stop() {
 	close(rom.stopChan)
 
 	if rom.log != nil {
-		rom.log.Info("[FIFO] stopped for node %s", rom.nodeID.String())
+		rom.log.Debug("[FIFO] stopped for node %s", rom.nodeID.String())
 	}
 }
 
